@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Mirror</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      color: #fff;
+      font-family: -apple-system, system-ui, sans-serif;
+    }
+    #stage {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden;
+    }
+    /* Video and drawing canvas sit exactly on top of each other */
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+    .mirrored { transform: scaleX(-1); }   /* flip like a mirror */
+    #status {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      font-size: 18px;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 6px 10px;
+      border-radius: 8px;
+    }
+    #knee {
+      position: absolute;
+      top: 56px;
+      left: 12px;
+      font-size: 36px;
+      font-weight: bold;
+      color: #ffeb3b;
+    }
+    #startBtn {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 24px;
+      padding: 16px 32px;
+      border: none;
+      border-radius: 12px;
+      background: #4caf50;
+      color: #fff;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div id="status">Loading the AI model...</div>
+    <div id="knee"></div>
+    <button id="startBtn" disabled>Start camera</button>
+  </div>
+
+  <script type="module">
+    // MediaPipe Pose Landmarker for the web (same model family as your Python version)
+    import { PoseLandmarker, FilesetResolver } from
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const kneeEl = document.getElementById("knee");
+    const startBtn = document.getElementById("startBtn");
+
+    // Body points only (no face): shoulders, elbows, wrists, hips, knees, ankles
+    const BODY_POINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
+    const BONES = [
+      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],   // arms + shoulders
+      [11, 23], [12, 24], [23, 24],                         // torso
+      [23, 25], [25, 27], [24, 26], [26, 28]                // legs
+    ];
+    const LEFT_LEG = [23, 25, 27];    // hip, knee, ankle
+    const RIGHT_LEG = [24, 26, 28];
+
+    // Angle at point b, in degrees (same formula as Python)
+    function angle(a, b, c) {
+      const bax = a.x - b.x, bay = a.y - b.y;
+      const bcx = c.x - b.x, bcy = c.y - b.y;
+      const dot = bax * bcx + bay * bcy;
+      const mag = Math.hypot(bax, bay) * Math.hypot(bcx, bcy) + 1e-6;
+      const cos = Math.min(1, Math.max(-1, dot / mag));
+      return Math.acos(cos) * 180 / Math.PI;
+    }
+
+    // Smoothing: average of the last 5 readings
+    const kneeHistory = [];
+    function smooth(value) {
+      kneeHistory.push(value);
+      if (kneeHistory.length > 5) kneeHistory.shift();
+      return kneeHistory.reduce((s, v) => s + v, 0) / kneeHistory.length;
+    }
+
+    // 1. Load the AI model
+    let landmarker;
+    async function loadModel() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      const options = (delegate) => ({
+        baseOptions: {
+          modelAssetPath:
+            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+          delegate
+        },
+        runningMode: "VIDEO",
+        numPoses: 1
+      });
+      try {
+        landmarker = await PoseLandmarker.createFromOptions(vision, options("GPU"));
+      } catch (e) {
+        // Some devices can't use the GPU; fall back to the CPU
+        landmarker = await PoseLandmarker.createFromOptions(vision, options("CPU"));
+      }
+      statusEl.textContent = "Model ready";
+      startBtn.disabled = false;
+    }
+
+    // 2. Start the camera (back camera on a phone if available)
+    async function startCamera() {
+      startBtn.style.display = "none";
+      statusEl.textContent = "Starting camera...";
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      // Mirror the view for front/laptop cameras, not for a phone's back camera
+      const facing = stream.getVideoTracks()[0].getSettings().facingMode;
+      if (facing !== "environment") {
+        video.classList.add("mirrored");
+        canvas.classList.add("mirrored");
+      }
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      statusEl.textContent = "Stand side-on, 2-3 metres away";
+      requestAnimationFrame(loop);
+    }
+
+    // 3. Every frame: find the body, draw it, measure the knee
+    let lastVideoTime = -1;
+    function loop() {
+      if (video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime;
+        const result = landmarker.detectForVideo(video, performance.now());
+        draw(result);
+      }
+      requestAnimationFrame(loop);
+    }
+
+    function draw(result) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!result.landmarks || result.landmarks.length === 0) {
+        kneeEl.textContent = "";
+        return;
+      }
+      const lms = result.landmarks[0];
+      // Convert 0-1 fractions into pixel positions
+      const p = (i) => ({ x: lms[i].x * canvas.width, y: lms[i].y * canvas.height });
+
+      // Draw the skeleton
+      ctx.strokeStyle = "white";
+      ctx.lineWidth = 4;
+      for (const [a, b] of BONES) {
+        ctx.beginPath();
+        ctx.moveTo(p(a).x, p(a).y);
+        ctx.lineTo(p(b).x, p(b).y);
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#00e676";
+      for (const i of BODY_POINTS) {
+        ctx.beginPath();
+        ctx.arc(p(i).x, p(i).y, 7, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+
+      // Pick the leg closest to the camera (highest visibility)
+      const vis = (leg) => leg.reduce((s, i) => s + lms[i].visibility, 0);
+      const [hip, knee, ankle] = vis(LEFT_LEG) >= vis(RIGHT_LEG) ? LEFT_LEG : RIGHT_LEG;
+      const legVis = Math.min(lms[hip].visibility, lms[knee].visibility, lms[ankle].visibility);
+
+      // Highlight the measured leg in yellow
+      ctx.strokeStyle = "#ffeb3b";
+      ctx.lineWidth = 8;
+      ctx.beginPath();
+      ctx.moveTo(p(hip).x, p(hip).y);
+      ctx.lineTo(p(knee).x, p(knee).y);
+      ctx.lineTo(p(ankle).x, p(ankle).y);
+      ctx.stroke();
+
+      if (legVis < 0.5) {
+        kneeEl.textContent = "Step back - I can't see your legs";
+        kneeEl.style.color = "#ff5252";
+      } else {
+        const kneeAngle = smooth(angle(p(hip), p(knee), p(ankle)));
+        kneeEl.textContent = `Knee: ${kneeAngle.toFixed(0)}°`;
+        kneeEl.style.color = "#ffeb3b";
+      }
+    }
+
+    startBtn.addEventListener("click", () => {
+      startCamera().catch((err) => {
+        statusEl.textContent = "Camera error: " + err.message;
+      });
+    });
+
+    loadModel().catch((err) => {
+      statusEl.textContent = "Model error: " + err.message;
+    });
+  </script>
+</body>
+</html>
