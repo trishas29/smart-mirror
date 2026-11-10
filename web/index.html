@@ -2,59 +2,91 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- viewport-fit=cover lets the page use the whole iPhone screen, including around the notch -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
   <title>Smart Mirror</title>
   <style>
-    body {
+    html, body {
       margin: 0;
+      height: 100%;
       background: #000;
       color: #fff;
       font-family: -apple-system, system-ui, sans-serif;
-    }
-    #stage {
-      position: relative;
-      width: 100vw;
-      height: 100vh;
       overflow: hidden;
     }
-    /* Video and drawing canvas sit exactly on top of each other */
+    #stage {
+      position: fixed;
+      inset: 0;              /* fill the whole screen */
+      width: 100vw;
+      height: 100dvh;        /* dvh = the real visible height on iPhone Safari */
+      overflow: hidden;
+    }
+    /* Video and drawing canvas fill the screen and stay lined up */
     video, canvas {
       position: absolute;
-      top: 0;
-      left: 0;
+      inset: 0;
       width: 100%;
       height: 100%;
-      object-fit: contain;
+      object-fit: cover;     /* fill the screen (crops the edges a little) */
     }
-    .mirrored { transform: scaleX(-1); }   /* flip like a mirror */
-    #status {
+    .mirrored { transform: scaleX(-1); }   /* flip like a real mirror */
+
+    /* Big, high-contrast text you can read from 2-3 metres away */
+    .big-text {
       position: absolute;
-      top: 12px;
-      left: 12px;
-      font-size: 18px;
-      background: rgba(0, 0, 0, 0.6);
-      padding: 6px 10px;
-      border-radius: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      max-width: 92vw;
+      text-align: center;
+      font-weight: 800;
+      line-height: 1.1;
+      padding: 0.25em 0.6em;
+      border-radius: 0.4em;
+      background: rgba(0, 0, 0, 0.75);
+      -webkit-text-stroke: 1px #000;
     }
     #knee {
-      position: absolute;
-      top: 56px;
-      left: 12px;
-      font-size: 36px;
-      font-weight: bold;
-      color: #ffeb3b;
+      top: calc(env(safe-area-inset-top) + 2vh);
+      font-size: clamp(40px, 13vw, 96px);
+      color: #fff200;        /* bright yellow */
     }
-    #startBtn {
+    #knee:empty { display: none; }
+    #status {
+      bottom: calc(env(safe-area-inset-bottom) + 3vh);
+      font-size: clamp(20px, 6vw, 40px);
+      color: #ffffff;
+    }
+    #status:empty { display: none; }
+
+    #controls {
       position: absolute;
-      top: 50%;
+      top: calc(env(safe-area-inset-top) + 50%);
       left: 50%;
       transform: translate(-50%, -50%);
-      font-size: 24px;
-      padding: 16px 32px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      align-items: center;
+    }
+    button {
+      font-size: clamp(22px, 6vw, 32px);
+      font-weight: 700;
+      padding: 18px 36px;
       border: none;
-      border-radius: 12px;
-      background: #4caf50;
+      border-radius: 16px;
+      background: #00c853;
       color: #fff;
+    }
+    button:disabled { background: #555; }
+    #flipBtn {
+      position: absolute;
+      right: 12px;
+      bottom: calc(env(safe-area-inset-bottom) + 12px);
+      font-size: 18px;
+      padding: 10px 16px;
+      background: rgba(255, 255, 255, 0.25);
+      display: none;
     }
   </style>
 </head>
@@ -62,13 +94,15 @@
   <div id="stage">
     <video id="video" playsinline muted></video>
     <canvas id="canvas"></canvas>
-    <div id="status">Loading the AI model...</div>
-    <div id="knee"></div>
-    <button id="startBtn" disabled>Start camera</button>
+    <div id="knee" class="big-text"></div>
+    <div id="status" class="big-text">Loading the AI model...</div>
+    <div id="controls">
+      <button id="startBtn" disabled>Start camera</button>
+    </div>
+    <button id="flipBtn">Switch camera</button>
   </div>
 
   <script type="module">
-    // MediaPipe Pose Landmarker for the web (same model family as your Python version)
     import { PoseLandmarker, FilesetResolver } from
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
@@ -77,26 +111,27 @@
     const ctx = canvas.getContext("2d");
     const statusEl = document.getElementById("status");
     const kneeEl = document.getElementById("knee");
+    const controls = document.getElementById("controls");
     const startBtn = document.getElementById("startBtn");
+    const flipBtn = document.getElementById("flipBtn");
 
     // Body points only (no face): shoulders, elbows, wrists, hips, knees, ankles
     const BODY_POINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
     const BONES = [
-      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],   // arms + shoulders
-      [11, 23], [12, 24], [23, 24],                         // torso
-      [23, 25], [25, 27], [24, 26], [26, 28]                // legs
+      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+      [11, 23], [12, 24], [23, 24],
+      [23, 25], [25, 27], [24, 26], [26, 28]
     ];
     const LEFT_LEG = [23, 25, 27];    // hip, knee, ankle
     const RIGHT_LEG = [24, 26, 28];
 
-    // Angle at point b, in degrees (same formula as Python)
+    // Angle at point b, in degrees
     function angle(a, b, c) {
       const bax = a.x - b.x, bay = a.y - b.y;
       const bcx = c.x - b.x, bcy = c.y - b.y;
       const dot = bax * bcx + bay * bcy;
       const mag = Math.hypot(bax, bay) * Math.hypot(bcx, bcy) + 1e-6;
-      const cos = Math.min(1, Math.max(-1, dot / mag));
-      return Math.acos(cos) * 180 / Math.PI;
+      return Math.acos(Math.min(1, Math.max(-1, dot / mag))) * 180 / Math.PI;
     }
 
     // Smoothing: average of the last 5 readings
@@ -125,44 +160,72 @@
       try {
         landmarker = await PoseLandmarker.createFromOptions(vision, options("GPU"));
       } catch (e) {
-        // Some devices can't use the GPU; fall back to the CPU
         landmarker = await PoseLandmarker.createFromOptions(vision, options("CPU"));
       }
-      statusEl.textContent = "Model ready";
+      statusEl.textContent = "Ready";
       startBtn.disabled = false;
     }
 
-    // 2. Start the camera (back camera on a phone if available)
+    // 2. Camera: front camera by default, so you can see your feedback
+    let facing = "user";          // "user" = front camera, "environment" = back camera
+    let stream = null;
+    let looping = false;
+
     async function startCamera() {
-      startBtn.style.display = "none";
+      if (stream) stream.getTracks().forEach((t) => t.stop());
       statusEl.textContent = "Starting camera...";
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+
+      // Ask for a camera shape that matches how the phone is held
+      const portrait = window.innerHeight > window.innerWidth;
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: facing },
+          width: { ideal: portrait ? 720 : 1280 },
+          height: { ideal: portrait ? 1280 : 720 }
+        },
         audio: false
       });
       video.srcObject = stream;
       await video.play();
 
-      // Mirror the view for front/laptop cameras, not for a phone's back camera
-      const facing = stream.getVideoTracks()[0].getSettings().facingMode;
-      if (facing !== "environment") {
-        video.classList.add("mirrored");
-        canvas.classList.add("mirrored");
-      }
+      // Mirror the front camera (like a real mirror); don't mirror the back camera
+      const actual = stream.getVideoTracks()[0].getSettings().facingMode || facing;
+      const mirror = actual !== "environment";
+      video.classList.toggle("mirrored", mirror);
+      canvas.classList.toggle("mirrored", mirror);
 
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
+      kneeHistory.length = 0;
+
+      controls.style.display = "none";
+      flipBtn.style.display = "block";
       statusEl.textContent = "Stand side-on, 2-3 metres away";
-      requestAnimationFrame(loop);
+      setTimeout(() => { if (statusEl.textContent.startsWith("Stand")) statusEl.textContent = ""; }, 5000);
+
+      keepScreenOn();
+      if (!looping) { looping = true; requestAnimationFrame(loop); }
     }
+
+    // Stop the phone screen from going to sleep mid-workout (if the phone supports it)
+    async function keepScreenOn() {
+      try { if ("wakeLock" in navigator) await navigator.wakeLock.request("screen"); } catch (e) {}
+    }
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && stream) keepScreenOn();
+    });
 
     // 3. Every frame: find the body, draw it, measure the knee
     let lastVideoTime = -1;
     function loop() {
-      if (video.currentTime !== lastVideoTime) {
+      if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
         lastVideoTime = video.currentTime;
-        const result = landmarker.detectForVideo(video, performance.now());
-        draw(result);
+        // If the camera size changed (e.g. phone rotated), resize the drawing layer
+        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+        }
+        draw(landmarker.detectForVideo(video, performance.now()));
       }
       requestAnimationFrame(loop);
     }
@@ -174,12 +237,13 @@
         return;
       }
       const lms = result.landmarks[0];
-      // Convert 0-1 fractions into pixel positions
       const p = (i) => ({ x: lms[i].x * canvas.width, y: lms[i].y * canvas.height });
 
-      // Draw the skeleton
+      // Thicker lines and dots, so they're visible from a distance
+      const scale = Math.max(canvas.width, canvas.height) / 1280;
+      ctx.lineCap = "round";
       ctx.strokeStyle = "white";
-      ctx.lineWidth = 4;
+      ctx.lineWidth = 6 * scale;
       for (const [a, b] of BONES) {
         ctx.beginPath();
         ctx.moveTo(p(a).x, p(a).y);
@@ -189,7 +253,7 @@
       ctx.fillStyle = "#00e676";
       for (const i of BODY_POINTS) {
         ctx.beginPath();
-        ctx.arc(p(i).x, p(i).y, 7, 0, 2 * Math.PI);
+        ctx.arc(p(i).x, p(i).y, 9 * scale, 0, 2 * Math.PI);
         ctx.fill();
       }
 
@@ -199,8 +263,8 @@
       const legVis = Math.min(lms[hip].visibility, lms[knee].visibility, lms[ankle].visibility);
 
       // Highlight the measured leg in yellow
-      ctx.strokeStyle = "#ffeb3b";
-      ctx.lineWidth = 8;
+      ctx.strokeStyle = "#fff200";
+      ctx.lineWidth = 12 * scale;
       ctx.beginPath();
       ctx.moveTo(p(hip).x, p(hip).y);
       ctx.lineTo(p(knee).x, p(knee).y);
@@ -208,24 +272,25 @@
       ctx.stroke();
 
       if (legVis < 0.5) {
-        kneeEl.textContent = "Step back - I can't see your legs";
-        kneeEl.style.color = "#ff5252";
+        kneeEl.textContent = "Step back — I can't see your legs";
+        kneeEl.style.color = "#ff4d4d";
+        kneeEl.style.fontSize = "clamp(28px, 8vw, 64px)";
       } else {
-        const kneeAngle = smooth(angle(p(hip), p(knee), p(ankle)));
-        kneeEl.textContent = `Knee: ${kneeAngle.toFixed(0)}°`;
-        kneeEl.style.color = "#ffeb3b";
+        kneeEl.textContent = `Knee ${smooth(angle(p(hip), p(knee), p(ankle))).toFixed(0)}°`;
+        kneeEl.style.color = "#fff200";
+        kneeEl.style.fontSize = "";
       }
     }
 
     startBtn.addEventListener("click", () => {
-      startCamera().catch((err) => {
-        statusEl.textContent = "Camera error: " + err.message;
-      });
+      startCamera().catch((err) => { statusEl.textContent = "Camera error: " + err.message; });
+    });
+    flipBtn.addEventListener("click", () => {
+      facing = facing === "user" ? "environment" : "user";
+      startCamera().catch((err) => { statusEl.textContent = "Camera error: " + err.message; });
     });
 
-    loadModel().catch((err) => {
-      statusEl.textContent = "Model error: " + err.message;
-    });
+    loadModel().catch((err) => { statusEl.textContent = "Model error: " + err.message; });
   </script>
 </body>
 </html>
