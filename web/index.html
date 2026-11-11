@@ -131,6 +131,15 @@
     const DEEP_ENOUGH = 80;   // lowest knee angle must get below this for a "Good rep!"
     const CUE_SECONDS = 2;    // how long a cue stays on screen
 
+    // ---------- Side-on check (Dr. Bini: trust bending angles only from the side) ----------
+    // When you face the camera, your shoulders look wide; side-on, they line up and look narrow.
+    const SIDE_ON_LIMIT = 20;          // degrees away from side-on before "Turn sideways" (try 10 later)
+    const SHOULDER_RATIO_FRONT = 0.75; // shoulder width ÷ torso length when facing the camera (typical)
+
+    // ---------- "Can I see you?" check ----------
+    const VIS_OK = 0.5;                // a point counts as visible above this score
+    const LOST_FRAMES = 15;            // about half a second of not seeing you before warning
+
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
@@ -174,7 +183,8 @@
 
     // ---------- Rep counter state ----------
     let state = "up";
-    let reps = 0;
+    let reps = 0;             // good reps only
+    let shallow = 0;          // reps that weren't deep enough (not counted)
     let setNumber = 1;
     let lowestKnee = 180;
     let lowestHipGap = 99;
@@ -182,7 +192,7 @@
     const log = [];           // every rep, for your accuracy testing
 
     function showReps() {
-      repsEl.textContent = `Reps ${reps}`;
+      repsEl.textContent = shallow > 0 ? `Reps ${reps} · ${shallow} shallow` : `Reps ${reps}`;
     }
 
     function showCue(text, color) {
@@ -193,12 +203,22 @@
 
     // Spoken cues, so you don't have to read the screen mid-rep
     let soundOn = true;
-    function say(text) {
-      if (!soundOn || !("speechSynthesis" in window)) return;
-      speechSynthesis.cancel();
+    function speakNow(text) {
       const u = new SpeechSynthesisUtterance(text);
-      u.rate = 1.1;
+      u.lang = "en-US";
+      u.rate = 1.05;
+      u.volume = 1;
       speechSynthesis.speak(u);
+    }
+    function say(text) {
+      if (!soundOn || !("speechSynthesis" in window) || !text) return;
+      if (speechSynthesis.speaking || speechSynthesis.pending) {
+        // iPhone bug: speaking right after cancel() gets dropped, so wait a moment
+        speechSynthesis.cancel();
+        setTimeout(() => speakNow(text), 120);
+      } else {
+        speakNow(text);
+      }
     }
 
     function updateReps(knee, hipGap) {
@@ -210,24 +230,26 @@
         lowestKnee = Math.min(lowestKnee, knee);
         lowestHipGap = Math.min(lowestHipGap, hipGap);
         if (knee > UP) {
-          // Back up = one finished rep
+          // Back up = one finished attempt. Only deep-enough reps count.
           state = "up";
-          reps += 1;
-          showReps();
           const good = lowestKnee <= DEEP_ENOUGH;
           if (good) {
+            reps += 1;
             showCue("Good rep!", "#00e676");
-            say(`${reps}. Good`);
+            say(String(reps));
           } else {
-            showCue("Go a little lower", "#ffab00");
-            say(`${reps}. Lower`);
+            shallow += 1;
+            showCue("Too shallow – go lower", "#ffab00");
+            say("Lower");
           }
+          showReps();
           const entry = {
             set: setNumber,
-            rep: reps,
+            attempt: reps + shallow,
+            counted: good ? "yes" : "no",
             lowestKnee: Math.round(lowestKnee),
             lowestHipGap: lowestHipGap.toFixed(2),
-            cue: good ? "Good rep" : "Go a little lower",
+            cue: good ? "Good rep" : "Too shallow",
             time: new Date().toLocaleTimeString()
           };
           log.push(entry);
@@ -242,19 +264,23 @@
       const vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
       );
-      const options = (delegate) => ({
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-          delegate
-        },
+      const MODEL = (size) =>
+        `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${size}/float16/latest/pose_landmarker_${size}.task`;
+      const options = (size, delegate) => ({
+        baseOptions: { modelAssetPath: MODEL(size), delegate },
         runningMode: "VIDEO",
-        numPoses: 1
+        numPoses: 1,
+        // Slightly lower than the defaults (0.5), so it finds you faster
+        minPoseDetectionConfidence: 0.4,
+        minPosePresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4
       });
       try {
-        landmarker = await PoseLandmarker.createFromOptions(vision, options("GPU"));
+        // "full" model: better at legs and ankles than "lite"; fast enough on a phone's GPU
+        landmarker = await PoseLandmarker.createFromOptions(vision, options("full", "GPU"));
       } catch (e) {
-        landmarker = await PoseLandmarker.createFromOptions(vision, options("CPU"));
+        // No GPU available: use the smaller model so it stays smooth
+        landmarker = await PoseLandmarker.createFromOptions(vision, options("lite", "CPU"));
       }
       statusEl.textContent = "Ready";
       startBtn.disabled = false;
@@ -325,10 +351,35 @@
       requestAnimationFrame(loop);
     }
 
+    let lostFrames = 0;           // frames in a row where it couldn't see you properly
+    let turnedWarned = false;     // so "Turn sideways" is spoken once, not every frame
+    const sideHistory = [];       // last few side-on estimates, for smoothing
+
+    // Warn only after ~half a second, so a single bad frame doesn't flash a warning
+    function cantSeeYou(message) {
+      lostFrames += 1;
+      if (lostFrames >= LOST_FRAMES) {
+        kneeEl.textContent = "";
+        showCue(message, "#ff4d4d");
+      }
+    }
+
+    // How far you are turned away from side-on, in degrees (0 = perfectly side-on, 90 = facing the camera)
+    function degreesFromSideOn(p) {
+      const shoulderWidth = Math.abs(p(11).x - p(12).x);
+      const midShoulder = { x: (p(11).x + p(12).x) / 2, y: (p(11).y + p(12).y) / 2 };
+      const midHip = { x: (p(23).x + p(24).x) / 2, y: (p(23).y + p(24).y) / 2 };
+      const torso = Math.max(Math.hypot(midShoulder.x - midHip.x, midShoulder.y - midHip.y), 1);
+      const ratio = Math.min(1, (shoulderWidth / torso) / SHOULDER_RATIO_FRONT);
+      sideHistory.push(Math.asin(ratio) * 180 / Math.PI);
+      if (sideHistory.length > 10) sideHistory.shift();
+      return sideHistory.reduce((s, v) => s + v, 0) / sideHistory.length;
+    }
+
     function draw(result) {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (!result.landmarks || result.landmarks.length === 0) {
-        kneeEl.textContent = "";
+        cantSeeYou("Step back so your whole body is on screen");
         return;
       }
       const lms = result.landmarks[0];
@@ -366,12 +417,24 @@
       ctx.lineTo(p(ankle).x, p(ankle).y);
       ctx.stroke();
 
-      if (legVis < 0.5) {
+      if (legVis < VIS_OK) {
         // Can't see the leg properly: warn and don't count
-        kneeEl.textContent = "";
-        showCue("Step back — I can't see your legs", "#ff4d4d");
+        cantSeeYou("Step back — I can't see your legs");
         return;
       }
+      lostFrames = 0;
+      if (cueEl.textContent.startsWith("Step back")) cueEl.textContent = "";
+
+      // Side-on check: angles are only trustworthy within a few degrees of side-on
+      const turned = degreesFromSideOn(p);
+      if (turned > SIDE_ON_LIMIT) {
+        kneeEl.textContent = "";
+        showCue("Turn sideways to the camera", "#ff4d4d");
+        if (!turnedWarned) { say("Turn sideways"); turnedWarned = true; }
+        return;   // pause counting while you're facing the camera
+      }
+      turnedWarned = false;
+      if (cueEl.textContent.startsWith("Turn sideways")) cueEl.textContent = "";
 
       const kneeAngle = smooth(angle(p(hip), p(knee), p(ankle)));
       // Hip gap: how far the hip is above the knee, divided by shin length.
@@ -385,7 +448,8 @@
 
     // ---------- Buttons ----------
     startBtn.addEventListener("click", () => {
-      say("");   // unlocks spoken cues on iPhone (they must start from a tap)
+      // iPhone only allows speech that starts from a tap, so say something real now
+      say("Let's go");
       startCamera().catch((err) => { statusEl.textContent = "Camera error: " + err.message; });
     });
 
@@ -395,8 +459,9 @@
     });
 
     newSetBtn.addEventListener("click", () => {
-      if (reps > 0) setNumber += 1;
+      if (reps + shallow > 0) setNumber += 1;
       reps = 0;
+      shallow = 0;
       state = "up";
       showReps();
       showCue(`Set ${setNumber}`, "#ffffff");
@@ -411,8 +476,8 @@
     // Save every rep as a spreadsheet file (CSV), for your accuracy testing
     saveBtn.addEventListener("click", () => {
       if (log.length === 0) { showCue("No reps yet", "#ffffff"); return; }
-      const header = "set,rep,lowest_knee_deg,lowest_hip_gap,cue,time";
-      const rows = log.map((r) => [r.set, r.rep, r.lowestKnee, r.lowestHipGap, r.cue, r.time].join(","));
+      const header = "set,attempt,counted,lowest_knee_deg,lowest_hip_gap,cue,time";
+      const rows = log.map((r) => [r.set, r.attempt, r.counted, r.lowestKnee, r.lowestHipGap, r.cue, r.time].join(","));
       const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
