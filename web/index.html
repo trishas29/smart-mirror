@@ -17,18 +17,17 @@
     }
     #stage {
       position: fixed;
-      inset: 0;              /* fill the whole screen */
+      inset: 0;
       width: 100vw;
-      height: 100dvh;        /* dvh = the real visible height on iPhone Safari */
+      height: 100dvh;        /* the real visible height on iPhone Safari */
       overflow: hidden;
     }
-    /* Video and drawing canvas fill the screen and stay lined up */
     video, canvas {
       position: absolute;
       inset: 0;
       width: 100%;
       height: 100%;
-      object-fit: cover;     /* fill the screen (crops the edges a little) */
+      object-fit: cover;
     }
     .mirrored { transform: scaleX(-1); }   /* flip like a real mirror */
 
@@ -41,35 +40,37 @@
       text-align: center;
       font-weight: 800;
       line-height: 1.1;
-      padding: 0.25em 0.6em;
+      padding: 0.2em 0.6em;
       border-radius: 0.4em;
       background: rgba(0, 0, 0, 0.75);
-      -webkit-text-stroke: 1px #000;
+    }
+    .big-text:empty { display: none; }
+
+    #reps {
+      top: calc(env(safe-area-inset-top) + 2vh);
+      font-size: clamp(48px, 16vw, 120px);
+      color: #ffffff;
     }
     #knee {
-      top: calc(env(safe-area-inset-top) + 2vh);
-      font-size: clamp(40px, 13vw, 96px);
+      top: calc(env(safe-area-inset-top) + 2vh + clamp(64px, 20vw, 150px));
+      font-size: clamp(22px, 6vw, 44px);
       color: #fff200;        /* bright yellow */
     }
-    #knee:empty { display: none; }
+    #cue {
+      bottom: calc(env(safe-area-inset-bottom) + 80px);
+      font-size: clamp(34px, 10vw, 80px);
+    }
     #status {
-      bottom: calc(env(safe-area-inset-bottom) + 3vh);
+      bottom: calc(env(safe-area-inset-bottom) + 80px);
       font-size: clamp(20px, 6vw, 40px);
       color: #ffffff;
     }
-    #status:empty { display: none; }
 
-    #controls {
+    #startBtn {
       position: absolute;
-      top: calc(env(safe-area-inset-top) + 50%);
+      top: 50%;
       left: 50%;
       transform: translate(-50%, -50%);
-      display: flex;
-      flex-direction: column;
-      gap: 16px;
-      align-items: center;
-    }
-    button {
       font-size: clamp(22px, 6vw, 32px);
       font-weight: 700;
       padding: 18px 36px;
@@ -78,15 +79,28 @@
       background: #00c853;
       color: #fff;
     }
-    button:disabled { background: #555; }
-    #flipBtn {
+    #startBtn:disabled { background: #555; }
+
+    /* Small buttons along the bottom */
+    #toolbar {
       position: absolute;
-      right: 12px;
+      left: 0;
+      right: 0;
       bottom: calc(env(safe-area-inset-bottom) + 12px);
-      font-size: 18px;
-      padding: 10px 16px;
-      background: rgba(255, 255, 255, 0.25);
       display: none;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 0 8px;
+    }
+    #toolbar button {
+      font-size: 16px;
+      font-weight: 600;
+      padding: 10px 14px;
+      border: none;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.25);
+      color: #fff;
     }
   </style>
 </head>
@@ -94,26 +108,42 @@
   <div id="stage">
     <video id="video" playsinline muted></video>
     <canvas id="canvas"></canvas>
+    <div id="reps" class="big-text"></div>
     <div id="knee" class="big-text"></div>
+    <div id="cue" class="big-text"></div>
     <div id="status" class="big-text">Loading the AI model...</div>
-    <div id="controls">
-      <button id="startBtn" disabled>Start camera</button>
+    <button id="startBtn" disabled>Start camera</button>
+    <div id="toolbar">
+      <button id="newSetBtn">New set</button>
+      <button id="soundBtn">Sound: on</button>
+      <button id="saveBtn">Save log</button>
+      <button id="flipBtn">Switch camera</button>
     </div>
-    <button id="flipBtn">Switch camera</button>
   </div>
 
   <script type="module">
     import { PoseLandmarker, FilesetResolver } from
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
+    // ---------- Squat settings (from your own measurements; tune these) ----------
+    const DOWN = 120;         // knee angle below this = you're squatting
+    const UP = 155;           // knee angle above this = standing again (rep done)
+    const DEEP_ENOUGH = 80;   // lowest knee angle must get below this for a "Good rep!"
+    const CUE_SECONDS = 2;    // how long a cue stays on screen
+
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
     const ctx = canvas.getContext("2d");
-    const statusEl = document.getElementById("status");
+    const repsEl = document.getElementById("reps");
     const kneeEl = document.getElementById("knee");
-    const controls = document.getElementById("controls");
+    const cueEl = document.getElementById("cue");
+    const statusEl = document.getElementById("status");
     const startBtn = document.getElementById("startBtn");
+    const toolbar = document.getElementById("toolbar");
     const flipBtn = document.getElementById("flipBtn");
+    const newSetBtn = document.getElementById("newSetBtn");
+    const soundBtn = document.getElementById("soundBtn");
+    const saveBtn = document.getElementById("saveBtn");
 
     // Body points only (no face): shoulders, elbows, wrists, hips, knees, ankles
     const BODY_POINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
@@ -142,7 +172,71 @@
       return kneeHistory.reduce((s, v) => s + v, 0) / kneeHistory.length;
     }
 
-    // 1. Load the AI model
+    // ---------- Rep counter state ----------
+    let state = "up";
+    let reps = 0;
+    let setNumber = 1;
+    let lowestKnee = 180;
+    let lowestHipGap = 99;
+    let cueUntil = 0;
+    const log = [];           // every rep, for your accuracy testing
+
+    function showReps() {
+      repsEl.textContent = `Reps ${reps}`;
+    }
+
+    function showCue(text, color) {
+      cueEl.textContent = text;
+      cueEl.style.color = color;
+      cueUntil = performance.now() + CUE_SECONDS * 1000;
+    }
+
+    // Spoken cues, so you don't have to read the screen mid-rep
+    let soundOn = true;
+    function say(text) {
+      if (!soundOn || !("speechSynthesis" in window)) return;
+      speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(text);
+      u.rate = 1.1;
+      speechSynthesis.speak(u);
+    }
+
+    function updateReps(knee, hipGap) {
+      if (state === "up" && knee < DOWN) {
+        state = "down";
+        lowestKnee = knee;
+        lowestHipGap = hipGap;
+      } else if (state === "down") {
+        lowestKnee = Math.min(lowestKnee, knee);
+        lowestHipGap = Math.min(lowestHipGap, hipGap);
+        if (knee > UP) {
+          // Back up = one finished rep
+          state = "up";
+          reps += 1;
+          showReps();
+          const good = lowestKnee <= DEEP_ENOUGH;
+          if (good) {
+            showCue("Good rep!", "#00e676");
+            say(`${reps}. Good`);
+          } else {
+            showCue("Go a little lower", "#ffab00");
+            say(`${reps}. Lower`);
+          }
+          const entry = {
+            set: setNumber,
+            rep: reps,
+            lowestKnee: Math.round(lowestKnee),
+            lowestHipGap: lowestHipGap.toFixed(2),
+            cue: good ? "Good rep" : "Go a little lower",
+            time: new Date().toLocaleTimeString()
+          };
+          log.push(entry);
+          console.log(entry);
+        }
+      }
+    }
+
+    // ---------- 1. Load the AI model ----------
     let landmarker;
     async function loadModel() {
       const vision = await FilesetResolver.forVisionTasks(
@@ -166,8 +260,8 @@
       startBtn.disabled = false;
     }
 
-    // 2. Camera: front camera by default, so you can see your feedback
-    let facing = "user";          // "user" = front camera, "environment" = back camera
+    // ---------- 2. Camera: front camera by default ----------
+    let facing = "user";      // "user" = front camera, "environment" = back camera
     let stream = null;
     let looping = false;
 
@@ -175,7 +269,6 @@
       if (stream) stream.getTracks().forEach((t) => t.stop());
       statusEl.textContent = "Starting camera...";
 
-      // Ask for a camera shape that matches how the phone is held
       const portrait = window.innerHeight > window.innerWidth;
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -188,7 +281,7 @@
       video.srcObject = stream;
       await video.play();
 
-      // Mirror the front camera (like a real mirror); don't mirror the back camera
+      // Mirror the front camera; don't mirror the back camera
       const actual = stream.getVideoTracks()[0].getSettings().facingMode || facing;
       const mirror = actual !== "environment";
       video.classList.toggle("mirrored", mirror);
@@ -198,8 +291,9 @@
       canvas.height = video.videoHeight;
       kneeHistory.length = 0;
 
-      controls.style.display = "none";
-      flipBtn.style.display = "block";
+      startBtn.style.display = "none";
+      toolbar.style.display = "flex";
+      showReps();
       statusEl.textContent = "Stand side-on, 2-3 metres away";
       setTimeout(() => { if (statusEl.textContent.startsWith("Stand")) statusEl.textContent = ""; }, 5000);
 
@@ -207,7 +301,7 @@
       if (!looping) { looping = true; requestAnimationFrame(loop); }
     }
 
-    // Stop the phone screen from going to sleep mid-workout (if the phone supports it)
+    // Stop the phone screen from going to sleep mid-workout (if supported)
     async function keepScreenOn() {
       try { if ("wakeLock" in navigator) await navigator.wakeLock.request("screen"); } catch (e) {}
     }
@@ -215,18 +309,19 @@
       if (document.visibilityState === "visible" && stream) keepScreenOn();
     });
 
-    // 3. Every frame: find the body, draw it, measure the knee
+    // ---------- 3. Every frame: find the body, draw it, count reps ----------
     let lastVideoTime = -1;
     function loop() {
       if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
         lastVideoTime = video.currentTime;
-        // If the camera size changed (e.g. phone rotated), resize the drawing layer
         if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
           canvas.width = video.videoWidth;
           canvas.height = video.videoHeight;
         }
         draw(landmarker.detectForVideo(video, performance.now()));
       }
+      // Hide the cue once its time is up
+      if (cueEl.textContent && performance.now() > cueUntil) cueEl.textContent = "";
       requestAnimationFrame(loop);
     }
 
@@ -239,7 +334,7 @@
       const lms = result.landmarks[0];
       const p = (i) => ({ x: lms[i].x * canvas.width, y: lms[i].y * canvas.height });
 
-      // Thicker lines and dots, so they're visible from a distance
+      // Thick lines and dots, visible from a distance
       const scale = Math.max(canvas.width, canvas.height) / 1280;
       ctx.lineCap = "round";
       ctx.strokeStyle = "white";
@@ -272,22 +367,58 @@
       ctx.stroke();
 
       if (legVis < 0.5) {
-        kneeEl.textContent = "Step back — I can't see your legs";
-        kneeEl.style.color = "#ff4d4d";
-        kneeEl.style.fontSize = "clamp(28px, 8vw, 64px)";
-      } else {
-        kneeEl.textContent = `Knee ${smooth(angle(p(hip), p(knee), p(ankle))).toFixed(0)}°`;
-        kneeEl.style.color = "#fff200";
-        kneeEl.style.fontSize = "";
+        // Can't see the leg properly: warn and don't count
+        kneeEl.textContent = "";
+        showCue("Step back — I can't see your legs", "#ff4d4d");
+        return;
       }
+
+      const kneeAngle = smooth(angle(p(hip), p(knee), p(ankle)));
+      // Hip gap: how far the hip is above the knee, divided by shin length.
+      // About 0 = hip level with knee; negative = hip below knee. (Logged for research.)
+      const shin = Math.max(Math.hypot(p(ankle).x - p(knee).x, p(ankle).y - p(knee).y), 1);
+      const hipGap = (p(knee).y - p(hip).y) / shin;
+
+      kneeEl.textContent = `Knee ${kneeAngle.toFixed(0)}°`;
+      updateReps(kneeAngle, hipGap);
     }
 
+    // ---------- Buttons ----------
     startBtn.addEventListener("click", () => {
+      say("");   // unlocks spoken cues on iPhone (they must start from a tap)
       startCamera().catch((err) => { statusEl.textContent = "Camera error: " + err.message; });
     });
+
     flipBtn.addEventListener("click", () => {
       facing = facing === "user" ? "environment" : "user";
       startCamera().catch((err) => { statusEl.textContent = "Camera error: " + err.message; });
+    });
+
+    newSetBtn.addEventListener("click", () => {
+      if (reps > 0) setNumber += 1;
+      reps = 0;
+      state = "up";
+      showReps();
+      showCue(`Set ${setNumber}`, "#ffffff");
+    });
+
+    soundBtn.addEventListener("click", () => {
+      soundOn = !soundOn;
+      soundBtn.textContent = `Sound: ${soundOn ? "on" : "off"}`;
+      if (!soundOn && "speechSynthesis" in window) speechSynthesis.cancel();
+    });
+
+    // Save every rep as a spreadsheet file (CSV), for your accuracy testing
+    saveBtn.addEventListener("click", () => {
+      if (log.length === 0) { showCue("No reps yet", "#ffffff"); return; }
+      const header = "set,rep,lowest_knee_deg,lowest_hip_gap,cue,time";
+      const rows = log.map((r) => [r.set, r.rep, r.lowestKnee, r.lowestHipGap, r.cue, r.time].join(","));
+      const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `mirror-log-${new Date().toISOString().slice(0, 10)}.csv`;
+      a.click();
+      URL.revokeObjectURL(a.href);
     });
 
     loadModel().catch((err) => { statusEl.textContent = "Model error: " + err.message; });
