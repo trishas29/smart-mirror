@@ -146,7 +146,7 @@
     const SIDE_ON_LIMIT = 20;          // under this many degrees from side-on = SIDE view (Dr. Bini: 10)
     const FRONT_ON_MIN = 60;           // over this = FRONT view; in between = "turn fully"
     const SHOULDER_RATIO_FRONT = 0.75; // shoulder width ÷ torso length when facing the camera (typical)
-    const MODE_SWITCH_FRAMES = 10;     // must face a new way for ~1/3 s before switching
+    const MODE_SWITCH_FRAMES = 10;     // must face a new way for ~2/3 s before switching
 
     // ---- General ----
     const VIS_OK = 0.5;           // a body point counts as visible above this score
@@ -240,20 +240,33 @@
                 .catch(() => { s.muted = false; });
       }
     }
+    // Speech: never interrupt. If something is already being said, keep only the
+    // newest message and say it next. (Cancelling speech over and over can lock up iPhone Safari.)
+    let speaking = false, speakStarted = 0, nextText = null;
     function speakNow(text) {
-      const u = new SpeechSynthesisUtterance(text);
-      u.lang = "en-US";
-      const voice = speechSynthesis.getVoices().find((vc) => vc.lang && vc.lang.startsWith("en"));
-      if (voice) u.voice = voice;
-      u.rate = 1.05;
-      speechSynthesis.speak(u);
+      try {
+        const u = new SpeechSynthesisUtterance(text);
+        u.lang = "en-US";
+        const voice = speechSynthesis.getVoices().find((vc) => vc.lang && vc.lang.startsWith("en"));
+        if (voice) u.voice = voice;
+        u.rate = 1.1;
+        const done = () => {
+          speaking = false;
+          if (nextText) { const t = nextText; nextText = null; setTimeout(() => speakNow(t), 50); }
+        };
+        u.onend = done;
+        u.onerror = done;
+        speaking = true;
+        speakStarted = performance.now();
+        speechSynthesis.speak(u);
+      } catch (e) { speaking = false; }
     }
     function say(text) {
       if (!soundOn || !("speechSynthesis" in window) || !text) return;
-      if (speechSynthesis.speaking || speechSynthesis.pending) {
-        speechSynthesis.cancel();
-        setTimeout(() => speakNow(text), 120);   // iPhone drops speech right after cancel()
+      if (speaking && performance.now() - speakStarted < 4000) {
+        nextText = text;          // say it when the current phrase ends
       } else {
+        speaking = false;         // nothing playing (or it got stuck): just speak
         speakNow(text);
       }
     }
@@ -398,7 +411,10 @@
 
     // Switch view only after facing a new way for a moment, so it doesn't flicker
     function decideMode(turned) {
-      const raw = turned < SIDE_ON_LIMIT ? "side" : turned > FRONT_ON_MIN ? "front" : "between";
+      // Hysteresis: once in a view, you must turn 10° further before it changes
+      let raw = turned < SIDE_ON_LIMIT ? "side" : turned > FRONT_ON_MIN ? "front" : "between";
+      if (mode === "side" && turned < SIDE_ON_LIMIT + 10) raw = "side";
+      if (mode === "front" && turned > FRONT_ON_MIN - 10) raw = "front";
       if (mode === null) { mode = raw; onModeChange(); return; }
       if (raw === mode) { modeCandidate = null; modeFrames = 0; return; }
       if (raw === modeCandidate) modeFrames += 1; else { modeCandidate = raw; modeFrames = 1; }
@@ -413,9 +429,14 @@
       heelBaseline = null;
       standingHeight = null;
       clearWarning();
-      if (mode === "side") { showCue("Side view: depth, chest, heels", "#ffffff"); say("Side view"); }
-      if (mode === "front") { showCue("Front view: knees", "#ffffff"); say("Front view"); }
+      // Only announce the view if it hasn't been announced in the last few seconds
+      const now = performance.now();
+      const announce = now - lastAnnounce > 4000;
+      if (mode === "side") { showCue("Side view: depth, chest, heels", "#ffffff"); if (announce) say("Side view"); }
+      if (mode === "front") { showCue("Front view: knees", "#ffffff"); if (announce) say("Front view"); }
+      if (announce && mode !== "between") lastAnnounce = now;
     }
+    let lastAnnounce = -1e9;
 
     // =====================================================================
     // 1. LOAD THE AI MODEL
@@ -491,19 +512,38 @@
     // =====================================================================
     // 3. EVERY FRAME: find the body, draw it, check form
     // =====================================================================
-    let lastVideoTime = -1;
+    // Runs ~15 times a second (plenty for squats) so the phone doesn't overheat or run out of memory.
+    // Any error is shown on screen instead of silently freezing the app.
+    const FRAME_MS = 66;
+    let lastVideoTime = -1, lastRun = 0, lastTimestamp = 0, errorCount = 0;
     function loop() {
-      if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
-        lastVideoTime = video.currentTime;
-        if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
-          canvas.width = video.videoWidth;
-          canvas.height = video.videoHeight;
+      try {
+        const now = performance.now();
+        if (video.readyState >= 2 && video.currentTime !== lastVideoTime && now - lastRun >= FRAME_MS) {
+          lastRun = now;
+          lastVideoTime = video.currentTime;
+          if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+          }
+          const ts = Math.max(Math.round(now), lastTimestamp + 1);   // timestamps must always increase
+          lastTimestamp = ts;
+          draw(landmarker.detectForVideo(video, ts));
+          errorCount = 0;
         }
-        draw(landmarker.detectForVideo(video, performance.now()));
+        if (cueEl.textContent && now > cueUntil) cueEl.textContent = "";
+      } catch (err) {
+        errorCount += 1;
+        statusEl.textContent = "Error: " + (err && err.message ? err.message : err);
+        console.error(err);
       }
-      if (cueEl.textContent && performance.now() > cueUntil) cueEl.textContent = "";
-      requestAnimationFrame(loop);
+      requestAnimationFrame(loop);   // always keep going, even after an error
     }
+
+    // Coming back to the app: restart the camera picture if iPhone paused it
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && stream && video.paused) video.play().catch(() => {});
+    });
 
     let lostFrames = 0;
     function cantSeeYou(message) {
