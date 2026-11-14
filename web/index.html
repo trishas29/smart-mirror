@@ -371,7 +371,7 @@
           state = "up";
           const deep = rep.lowestKnee <= DEEP_ENOUGH;
           const leaning = rep.maxLean > LEAN_LIMIT;
-          const heelsUp = rep.heelUp;
+          const heelsUp = false;   // heel check removed: too unreliable with one phone camera
           // One cue at a time, most important first
           if (!deep) finishRep("side", false, "Too shallow – go lower", "Lower");
           else if (leaning) finishRep("side", true, "Keep your chest up", `${reps + 1}. Chest up`);
@@ -441,7 +441,7 @@
       // Only announce the view if it hasn't been announced in the last few seconds
       const now = performance.now();
       const announce = now - lastAnnounce > 4000;
-      if (mode === "side") { showCue("Side view: depth, chest, heels", "#ffffff"); if (announce) say("Side view"); }
+      if (mode === "side") { showCue("Side view: depth and back", "#ffffff"); if (announce) say("Side view"); }
       if (mode === "front") { showCue("Front view: knees", "#ffffff"); if (announce) say("Front view"); }
       if (announce && mode !== "between") lastAnnounce = now;
     }
@@ -513,7 +513,7 @@
       startBtn.style.display = "none";
       toolbar.style.display = "flex";
       showReps();
-      statusEl.textContent = "Stand side-on: depth, back, heels";
+      statusEl.textContent = "Stand side-on: depth and back";
       setTimeout(() => { if (statusEl.textContent.startsWith("Stand")) statusEl.textContent = ""; }, 6000);
       keepScreenOn();
       if (!looping) { looping = true; requestAnimationFrame(loop); }
