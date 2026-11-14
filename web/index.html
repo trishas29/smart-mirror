@@ -125,20 +125,35 @@
     import { PoseLandmarker, FilesetResolver } from
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
 
-    // ---------- Squat settings (from your own measurements; tune these) ----------
-    const DOWN = 120;         // knee angle below this = you're squatting
-    const UP = 155;           // knee angle above this = standing again (rep done)
-    const DEEP_ENOUGH = 80;   // lowest knee angle must get below this for a "Good rep!"
-    const CUE_SECONDS = 2;    // how long a cue stays on screen
+    // =====================================================================
+    // SETTINGS — tune these from your own testing
+    // =====================================================================
 
-    // ---------- Side-on check (Dr. Bini: trust bending angles only from the side) ----------
-    // When you face the camera, your shoulders look wide; side-on, they line up and look narrow.
-    const SIDE_ON_LIMIT = 20;          // degrees away from side-on before "Turn sideways" (try 10 later)
+    // ---- SIDE VIEW: depth, chest and heels ----
+    const DOWN = 120;             // knee angle below this = you're squatting
+    const UP = 155;               // knee angle above this = standing again (rep done)
+    const DEEP_ENOUGH = 80;       // lowest knee angle must get below this to count
+    const LEAN_LIMIT = 50;        // torso leaning more than this (degrees from upright) = "Chest up"
+    const HEEL_LIFT_LIMIT = 0.15; // heel rising more than 15% of your foot length = "Heels down"
+
+    // ---- FRONT VIEW: knees caving in ----
+    const FRONT_DOWN = 0.85;      // hip height below 85% of your standing hip height = squatting
+    const FRONT_UP = 0.95;        // back above 95% = standing again (rep done)
+    const KNEES_IN_LIMIT = 0.80;  // knee gap less than 80% of ankle gap = knees caving in
+
+    // ---- Which way you're facing ----
+    // Side-on, your shoulders line up and look narrow; facing the camera, they look wide.
+    const SIDE_ON_LIMIT = 20;          // under this many degrees from side-on = SIDE view (Dr. Bini: 10)
+    const FRONT_ON_MIN = 60;           // over this = FRONT view; in between = "turn fully"
     const SHOULDER_RATIO_FRONT = 0.75; // shoulder width ÷ torso length when facing the camera (typical)
+    const MODE_SWITCH_FRAMES = 10;     // must face a new way for ~1/3 s before switching
 
-    // ---------- "Can I see you?" check ----------
-    const VIS_OK = 0.5;                // a point counts as visible above this score
-    const LOST_FRAMES = 15;            // about half a second of not seeing you before warning
+    // ---- General ----
+    const VIS_OK = 0.5;           // a body point counts as visible above this score
+    const LOST_FRAMES = 15;       // ~half a second of not seeing you before warning
+    const CUE_SECONDS = 2;        // how long a cue stays on screen
+
+    // =====================================================================
 
     const video = document.getElementById("video");
     const canvas = document.getElementById("canvas");
@@ -154,15 +169,17 @@
     const soundBtn = document.getElementById("soundBtn");
     const saveBtn = document.getElementById("saveBtn");
 
-    // Body points only (no face): shoulders, elbows, wrists, hips, knees, ankles
-    const BODY_POINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
+    // MediaPipe point numbers
+    const L = { shoulder: 11, hip: 23, knee: 25, ankle: 27, heel: 29, toe: 31 };
+    const R = { shoulder: 12, hip: 24, knee: 26, ankle: 28, heel: 30, toe: 32 };
+    // Body points only (no face), now including heels and toes
+    const BODY_POINTS = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
     const BONES = [
-      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
-      [11, 23], [12, 24], [23, 24],
-      [23, 25], [25, 27], [24, 26], [26, 28]
+      [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],   // arms + shoulders
+      [11, 23], [12, 24], [23, 24],                         // torso
+      [23, 25], [25, 27], [24, 26], [26, 28],               // legs
+      [27, 29], [29, 31], [27, 31], [28, 30], [30, 32], [28, 32]  // feet
     ];
-    const LEFT_LEG = [23, 25, 27];    // hip, knee, ankle
-    const RIGHT_LEG = [24, 26, 28];
 
     // Angle at point b, in degrees
     function angle(a, b, c) {
@@ -172,45 +189,29 @@
       const mag = Math.hypot(bax, bay) * Math.hypot(bcx, bcy) + 1e-6;
       return Math.acos(Math.min(1, Math.max(-1, dot / mag))) * 180 / Math.PI;
     }
+    const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
-    // Smoothing: average of the last 5 readings
-    const kneeHistory = [];
-    function smooth(value) {
-      kneeHistory.push(value);
-      if (kneeHistory.length > 5) kneeHistory.shift();
-      return kneeHistory.reduce((s, v) => s + v, 0) / kneeHistory.length;
+    // Smoothing: average of the last n readings (one smoother per measurement)
+    function makeSmoother(n) {
+      let h = [];
+      const f = (v) => { h.push(v); if (h.length > n) h.shift(); return h.reduce((s, x) => s + x, 0) / h.length; };
+      f.reset = () => { h = []; };
+      return f;
     }
+    const smoothKnee = makeSmoother(5);
+    const smoothLean = makeSmoother(5);
+    const smoothHeel = makeSmoother(5);
+    const smoothHeight = makeSmoother(5);
+    const smoothKneeRatio = makeSmoother(5);
+    const smoothTurn = makeSmoother(10);
 
-    // ---------- Rep counter state ----------
-    let state = "up";
-    let reps = 0;             // good reps only
-    let shallow = 0;          // reps that weren't deep enough (not counted)
-    let setNumber = 1;
-    let lowestKnee = 180;
-    let lowestHipGap = 99;
-    let cueUntil = 0;
-    const log = [];           // every rep, for your accuracy testing
-
-    function showReps() {
-      repsEl.textContent = shallow > 0 ? `Reps ${reps} · ${shallow} shallow` : `Reps ${reps}`;
-    }
-
-    function showCue(text, color) {
-      cueEl.textContent = text;
-      cueEl.style.color = color;
-      cueUntil = performance.now() + CUE_SECONDS * 1000;
-    }
-
-    // Spoken cues, so you don't have to read the screen mid-rep
+    // =====================================================================
+    // SOUND (beeps + voice)
+    // =====================================================================
     let soundOn = true;
-
-    // Ask iPhone to play sound through the speaker even on silent mode / while the camera is on
-    // (works on newer iPhones; older ones just ignore it)
     function useLoudSpeaker() {
       try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
     }
-
-    // Beeps: a backup in case spoken feedback is blocked. Built in code, so no sound files needed.
     function makeBeep(freq, ms) {
       const rate = 22050, n = Math.floor(rate * ms / 1000);
       const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
@@ -220,20 +221,17 @@
       v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
       v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, n * 2, true);
       for (let i = 0; i < n; i++) {
-        const fade = Math.min(1, i / 200, (n - i) / 200);   // avoid clicks
+        const fade = Math.min(1, i / 200, (n - i) / 200);
         v.setInt16(44 + i * 2, Math.sin(2 * Math.PI * freq * i / rate) * 0.6 * fade * 32767, true);
       }
       return new Audio(URL.createObjectURL(new Blob([buf], { type: "audio/wav" })));
     }
-    const goodBeep = makeBeep(880, 180);   // high beep = good rep
-    const lowBeep = makeBeep(330, 300);    // low beep = too shallow / warning
-
+    const goodBeep = makeBeep(880, 180);   // high beep = perfect rep
+    const lowBeep = makeBeep(330, 300);    // low beep = something to fix
     function beep(sound) {
       if (!soundOn) return;
       try { sound.currentTime = 0; sound.play().catch(() => {}); } catch (e) {}
     }
-
-    // Must run inside a tap: iPhone only allows sound that starts from one
     function unlockSound() {
       useLoudSpeaker();
       for (const s of [goodBeep, lowBeep]) {
@@ -242,67 +240,186 @@
                 .catch(() => { s.muted = false; });
       }
     }
-
     function speakNow(text) {
       const u = new SpeechSynthesisUtterance(text);
       u.lang = "en-US";
       const voice = speechSynthesis.getVoices().find((vc) => vc.lang && vc.lang.startsWith("en"));
       if (voice) u.voice = voice;
       u.rate = 1.05;
-      u.volume = 1;
       speechSynthesis.speak(u);
     }
     function say(text) {
       if (!soundOn || !("speechSynthesis" in window) || !text) return;
       if (speechSynthesis.speaking || speechSynthesis.pending) {
-        // iPhone bug: speaking right after cancel() gets dropped, so wait a moment
         speechSynthesis.cancel();
-        setTimeout(() => speakNow(text), 120);
+        setTimeout(() => speakNow(text), 120);   // iPhone drops speech right after cancel()
       } else {
         speakNow(text);
       }
     }
 
-    function updateReps(knee, hipGap) {
-      if (state === "up" && knee < DOWN) {
+    // =====================================================================
+    // REP COUNTING AND FORM CHECKS
+    // =====================================================================
+    let mode = null;              // "side", "front" or "between"
+    let modeCandidate = null, modeFrames = 0;
+    let state = "up";
+    let reps = 0;                 // counted reps
+    let shallow = 0;              // side-view reps that weren't deep enough (not counted)
+    let setNumber = 1;
+    let rep = {};                 // the worst values seen during the current rep
+    let heelBaseline = null;      // what "heels flat" looks like for you, learned while standing
+    let standingHeight = null;    // your standing hip height (front view)
+    let cueUntil = 0;
+    let warned = "";              // so a warning is spoken once, not every frame
+    const log = [];
+
+    function resetRep() {
+      rep = { lowestKnee: 180, maxLean: 0, maxHeel: 0, heelSeen: false, lowestHipGap: 99,
+              minKneeRatio: 9, kneesSeen: false };
+    }
+    resetRep();
+
+    function showReps() {
+      repsEl.textContent = shallow > 0 ? `Reps ${reps} · ${shallow} shallow` : `Reps ${reps}`;
+    }
+    function showCue(text, color) {
+      cueEl.textContent = text;
+      cueEl.style.color = color;
+      cueUntil = performance.now() + CUE_SECONDS * 1000;
+    }
+    function warn(text, speech) {
+      kneeEl.textContent = "";
+      showCue(text, "#ff4d4d");
+      if (warned !== text) { warned = text; beep(lowBeep); say(speech); }
+    }
+    function clearWarning() {
+      if (warned && cueEl.textContent === warned) cueEl.textContent = "";
+      warned = "";
+    }
+
+    function finishRep(view, counted, problem, speech) {
+      if (counted) reps += 1; else shallow += 1;
+      showReps();
+      if (problem) {
+        showCue(problem, "#ffab00");
+        beep(lowBeep);
+      } else {
+        showCue("Good rep!", "#00e676");
+        beep(goodBeep);
+      }
+      say(speech);
+      const entry = {
+        set: setNumber,
+        attempt: reps + shallow,
+        view,
+        counted: counted ? "yes" : "no",
+        lowestKnee: view === "side" ? Math.round(rep.lowestKnee) : "",
+        maxLean: view === "side" ? Math.round(rep.maxLean) : "",
+        maxHeelLift: view === "side" ? (rep.heelSeen ? rep.maxHeel.toFixed(2) : "not seen") : "",
+        minKneeRatio: view === "front" ? (rep.kneesSeen ? rep.minKneeRatio.toFixed(2) : "not seen") : "",
+        lowestHipGap: view === "side" ? rep.lowestHipGap.toFixed(2) : "",
+        cue: problem || "Good rep",
+        time: new Date().toLocaleTimeString()
+      };
+      log.push(entry);
+      console.log(entry);
+    }
+
+    // ---- SIDE VIEW: one frame ----
+    // f = { knee, lean, hipGap, heelRise (or null if feet not visible) }
+    function sideFrame(f) {
+      // Learn what "heels flat" looks like while you stand tall
+      if (state === "up" && f.knee > UP && f.heelRise !== null) {
+        heelBaseline = heelBaseline === null ? f.heelRise : heelBaseline * 0.9 + f.heelRise * 0.1;
+      }
+      if (state === "up" && f.knee < DOWN) {
         state = "down";
-        lowestKnee = knee;
-        lowestHipGap = hipGap;
-      } else if (state === "down") {
-        lowestKnee = Math.min(lowestKnee, knee);
-        lowestHipGap = Math.min(lowestHipGap, hipGap);
-        if (knee > UP) {
-          // Back up = one finished attempt. Only deep-enough reps count.
+        resetRep();
+      }
+      if (state === "down") {
+        rep.lowestKnee = Math.min(rep.lowestKnee, f.knee);
+        rep.maxLean = Math.max(rep.maxLean, f.lean);
+        rep.lowestHipGap = Math.min(rep.lowestHipGap, f.hipGap);
+        if (f.heelRise !== null && heelBaseline !== null) {
+          rep.heelSeen = true;
+          rep.maxHeel = Math.max(rep.maxHeel, f.heelRise - heelBaseline);
+        }
+        if (f.knee > UP) {
           state = "up";
-          const good = lowestKnee <= DEEP_ENOUGH;
-          if (good) {
-            reps += 1;
-            showCue("Good rep!", "#00e676");
-            beep(goodBeep);
-            say(String(reps));
-          } else {
-            shallow += 1;
-            showCue("Too shallow – go lower", "#ffab00");
-            beep(lowBeep);
-            say("Lower");
-          }
-          showReps();
-          const entry = {
-            set: setNumber,
-            attempt: reps + shallow,
-            counted: good ? "yes" : "no",
-            lowestKnee: Math.round(lowestKnee),
-            lowestHipGap: lowestHipGap.toFixed(2),
-            cue: good ? "Good rep" : "Too shallow",
-            time: new Date().toLocaleTimeString()
-          };
-          log.push(entry);
-          console.log(entry);
+          const deep = rep.lowestKnee <= DEEP_ENOUGH;
+          const leaning = rep.maxLean > LEAN_LIMIT;
+          const heelsUp = rep.heelSeen && rep.maxHeel > HEEL_LIFT_LIMIT;
+          // One cue at a time, most important first
+          if (!deep) finishRep("side", false, "Too shallow – go lower", "Lower");
+          else if (leaning) finishRep("side", true, "Keep your chest up", `${reps + 1}. Chest up`);
+          else if (heelsUp) finishRep("side", true, "Keep your heels down", `${reps + 1}. Heels down`);
+          else finishRep("side", true, null, String(reps + 1));
         }
       }
     }
 
-    // ---------- 1. Load the AI model ----------
+    // ---- FRONT VIEW: one frame ----
+    // f = { height (hip-to-ankle height in pixels), kneeRatio (or null if feet too close) }
+    function frontFrame(f) {
+      if (standingHeight === null) standingHeight = f.height;
+      if (state === "up") standingHeight = Math.max(f.height, standingHeight * 0.998);
+      const ratio = f.height / standingHeight;
+      if (state === "up" && ratio < FRONT_DOWN) {
+        state = "down";
+        resetRep();
+      }
+      if (state === "down") {
+        if (f.kneeRatio !== null) {
+          rep.kneesSeen = true;
+          rep.minKneeRatio = Math.min(rep.minKneeRatio, f.kneeRatio);
+        }
+        if (ratio > FRONT_UP) {
+          state = "up";
+          const kneesIn = rep.kneesSeen && rep.minKneeRatio < KNEES_IN_LIMIT;
+          // Depth isn't judged from the front (front-view angles are unreliable), so every rep counts
+          if (kneesIn) finishRep("front", true, "Push your knees out", `${reps + 1}. Knees out`);
+          else finishRep("front", true, null, String(reps + 1));
+        }
+      }
+      return ratio;
+    }
+
+    // ---- Which way are you facing? ----
+    // Degrees away from side-on: 0 = perfectly side-on, 90 = facing the camera
+    function degreesFromSideOn(p) {
+      const shoulderWidth = Math.abs(p(11).x - p(12).x);
+      const midShoulder = { x: (p(11).x + p(12).x) / 2, y: (p(11).y + p(12).y) / 2 };
+      const midHip = { x: (p(23).x + p(24).x) / 2, y: (p(23).y + p(24).y) / 2 };
+      const torso = Math.max(dist(midShoulder, midHip), 1);
+      const ratio = Math.min(1, (shoulderWidth / torso) / SHOULDER_RATIO_FRONT);
+      return smoothTurn(Math.asin(ratio) * 180 / Math.PI);
+    }
+
+    // Switch view only after facing a new way for a moment, so it doesn't flicker
+    function decideMode(turned) {
+      const raw = turned < SIDE_ON_LIMIT ? "side" : turned > FRONT_ON_MIN ? "front" : "between";
+      if (mode === null) { mode = raw; onModeChange(); return; }
+      if (raw === mode) { modeCandidate = null; modeFrames = 0; return; }
+      if (raw === modeCandidate) modeFrames += 1; else { modeCandidate = raw; modeFrames = 1; }
+      if (modeFrames >= MODE_SWITCH_FRAMES) { mode = raw; modeCandidate = null; modeFrames = 0; onModeChange(); }
+    }
+
+    function onModeChange() {
+      // Start fresh: angles from the old view don't apply to the new one
+      state = "up";
+      resetRep();
+      for (const s of [smoothKnee, smoothLean, smoothHeel, smoothHeight, smoothKneeRatio]) s.reset();
+      heelBaseline = null;
+      standingHeight = null;
+      clearWarning();
+      if (mode === "side") { showCue("Side view: depth, chest, heels", "#ffffff"); say("Side view"); }
+      if (mode === "front") { showCue("Front view: knees", "#ffffff"); say("Front view"); }
+    }
+
+    // =====================================================================
+    // 1. LOAD THE AI MODEL
+    // =====================================================================
     let landmarker;
     async function loadModel() {
       const vision = await FilesetResolver.forVisionTasks(
@@ -314,31 +431,29 @@
         baseOptions: { modelAssetPath: MODEL(size), delegate },
         runningMode: "VIDEO",
         numPoses: 1,
-        // Slightly lower than the defaults (0.5), so it finds you faster
         minPoseDetectionConfidence: 0.4,
         minPosePresenceConfidence: 0.4,
         minTrackingConfidence: 0.4
       });
       try {
-        // "full" model: better at legs and ankles than "lite"; fast enough on a phone's GPU
         landmarker = await PoseLandmarker.createFromOptions(vision, options("full", "GPU"));
       } catch (e) {
-        // No GPU available: use the smaller model so it stays smooth
         landmarker = await PoseLandmarker.createFromOptions(vision, options("lite", "CPU"));
       }
       statusEl.textContent = "Ready";
       startBtn.disabled = false;
     }
 
-    // ---------- 2. Camera: front camera by default ----------
-    let facing = "user";      // "user" = front camera, "environment" = back camera
+    // =====================================================================
+    // 2. CAMERA (front camera by default)
+    // =====================================================================
+    let facing = "user";
     let stream = null;
     let looping = false;
 
     async function startCamera() {
       if (stream) stream.getTracks().forEach((t) => t.stop());
       statusEl.textContent = "Starting camera...";
-
       const portrait = window.innerHeight > window.innerWidth;
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
@@ -350,28 +465,22 @@
       });
       video.srcObject = stream;
       await video.play();
-
-      // Mirror the front camera; don't mirror the back camera
       const actual = stream.getVideoTracks()[0].getSettings().facingMode || facing;
       const mirror = actual !== "environment";
       video.classList.toggle("mirrored", mirror);
       canvas.classList.toggle("mirrored", mirror);
-
       canvas.width = video.videoWidth;
       canvas.height = video.videoHeight;
-      kneeHistory.length = 0;
-
+      mode = null;
       startBtn.style.display = "none";
       toolbar.style.display = "flex";
       showReps();
-      statusEl.textContent = "Stand side-on, 2-3 metres away";
-      setTimeout(() => { if (statusEl.textContent.startsWith("Stand")) statusEl.textContent = ""; }, 5000);
-
+      statusEl.textContent = "Side-on: depth, chest, heels · Facing me: knees";
+      setTimeout(() => { if (statusEl.textContent.startsWith("Side-on")) statusEl.textContent = ""; }, 6000);
       keepScreenOn();
       if (!looping) { looping = true; requestAnimationFrame(loop); }
     }
 
-    // Stop the phone screen from going to sleep mid-workout (if supported)
     async function keepScreenOn() {
       try { if ("wakeLock" in navigator) await navigator.wakeLock.request("screen"); } catch (e) {}
     }
@@ -379,7 +488,9 @@
       if (document.visibilityState === "visible" && stream) keepScreenOn();
     });
 
-    // ---------- 3. Every frame: find the body, draw it, count reps ----------
+    // =====================================================================
+    // 3. EVERY FRAME: find the body, draw it, check form
+    // =====================================================================
     let lastVideoTime = -1;
     function loop() {
       if (video.readyState >= 2 && video.currentTime !== lastVideoTime) {
@@ -390,34 +501,14 @@
         }
         draw(landmarker.detectForVideo(video, performance.now()));
       }
-      // Hide the cue once its time is up
       if (cueEl.textContent && performance.now() > cueUntil) cueEl.textContent = "";
       requestAnimationFrame(loop);
     }
 
-    let lostFrames = 0;           // frames in a row where it couldn't see you properly
-    let turnedWarned = false;     // so "Turn sideways" is spoken once, not every frame
-    const sideHistory = [];       // last few side-on estimates, for smoothing
-
-    // Warn only after ~half a second, so a single bad frame doesn't flash a warning
+    let lostFrames = 0;
     function cantSeeYou(message) {
       lostFrames += 1;
-      if (lostFrames >= LOST_FRAMES) {
-        kneeEl.textContent = "";
-        showCue(message, "#ff4d4d");
-      }
-    }
-
-    // How far you are turned away from side-on, in degrees (0 = perfectly side-on, 90 = facing the camera)
-    function degreesFromSideOn(p) {
-      const shoulderWidth = Math.abs(p(11).x - p(12).x);
-      const midShoulder = { x: (p(11).x + p(12).x) / 2, y: (p(11).y + p(12).y) / 2 };
-      const midHip = { x: (p(23).x + p(24).x) / 2, y: (p(23).y + p(24).y) / 2 };
-      const torso = Math.max(Math.hypot(midShoulder.x - midHip.x, midShoulder.y - midHip.y), 1);
-      const ratio = Math.min(1, (shoulderWidth / torso) / SHOULDER_RATIO_FRONT);
-      sideHistory.push(Math.asin(ratio) * 180 / Math.PI);
-      if (sideHistory.length > 10) sideHistory.shift();
-      return sideHistory.reduce((s, v) => s + v, 0) / sideHistory.length;
+      if (lostFrames >= LOST_FRAMES) warn(message, "Step back");
     }
 
     function draw(result) {
@@ -428,71 +519,94 @@
       }
       const lms = result.landmarks[0];
       const p = (i) => ({ x: lms[i].x * canvas.width, y: lms[i].y * canvas.height });
+      const seen = (...ids) => ids.every((i) => lms[i].visibility >= VIS_OK);
 
-      // Thick lines and dots, visible from a distance
+      // Skeleton: thick lines and dots, visible from a distance
       const scale = Math.max(canvas.width, canvas.height) / 1280;
       ctx.lineCap = "round";
       ctx.strokeStyle = "white";
       ctx.lineWidth = 6 * scale;
       for (const [a, b] of BONES) {
-        ctx.beginPath();
-        ctx.moveTo(p(a).x, p(a).y);
-        ctx.lineTo(p(b).x, p(b).y);
-        ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(p(a).x, p(a).y); ctx.lineTo(p(b).x, p(b).y); ctx.stroke();
       }
       ctx.fillStyle = "#00e676";
       for (const i of BODY_POINTS) {
+        ctx.beginPath(); ctx.arc(p(i).x, p(i).y, 9 * scale, 0, 2 * Math.PI); ctx.fill();
+      }
+      const highlight = (ids, color) => {
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 12 * scale;
         ctx.beginPath();
-        ctx.arc(p(i).x, p(i).y, 9 * scale, 0, 2 * Math.PI);
-        ctx.fill();
+        ctx.moveTo(p(ids[0]).x, p(ids[0]).y);
+        for (const i of ids.slice(1)) ctx.lineTo(p(i).x, p(i).y);
+        ctx.stroke();
+      };
+
+      decideMode(degreesFromSideOn(p));
+
+      if (mode === "between") {
+        warn("Turn fully sideways – or face me", "Turn sideways");
+        return;   // angles aren't trustworthy at this angle, so pause
       }
 
-      // Pick the leg closest to the camera (highest visibility)
-      const vis = (leg) => leg.reduce((s, i) => s + lms[i].visibility, 0);
-      const [hip, knee, ankle] = vis(LEFT_LEG) >= vis(RIGHT_LEG) ? LEFT_LEG : RIGHT_LEG;
-      const legVis = Math.min(lms[hip].visibility, lms[knee].visibility, lms[ankle].visibility);
+      if (mode === "side") {
+        // Use the side closest to the camera (highest visibility)
+        const vis = (s) => lms[s.hip].visibility + lms[s.knee].visibility + lms[s.ankle].visibility;
+        const s = vis(L) >= vis(R) ? L : R;
+        if (!seen(s.hip, s.knee, s.ankle)) { cantSeeYou("Step back — I can't see your legs"); return; }
+        lostFrames = 0;
+        if (warned.startsWith("Step back") || warned.startsWith("Turn")) clearWarning();
 
-      // Highlight the measured leg in yellow
-      ctx.strokeStyle = "#fff200";
-      ctx.lineWidth = 12 * scale;
-      ctx.beginPath();
-      ctx.moveTo(p(hip).x, p(hip).y);
-      ctx.lineTo(p(knee).x, p(knee).y);
-      ctx.lineTo(p(ankle).x, p(ankle).y);
-      ctx.stroke();
+        highlight([s.shoulder, s.hip, s.knee, s.ankle], "#fff200");
 
-      if (legVis < VIS_OK) {
-        // Can't see the leg properly: warn and don't count
-        cantSeeYou("Step back — I can't see your legs");
-        return;
+        const knee = smoothKnee(angle(p(s.hip), p(s.knee), p(s.ankle)));
+        // Torso lean: shoulder-to-hip line compared with straight up (0° = upright)
+        const sh = p(s.shoulder), hp = p(s.hip);
+        const lean = smoothLean(Math.atan2(Math.abs(sh.x - hp.x), Math.max(hp.y - sh.y, 1)) * 180 / Math.PI);
+        // Hip gap (logged for research): hip height above knee ÷ shin length
+        const shin = Math.max(dist(p(s.ankle), p(s.knee)), 1);
+        const hipGap = (p(s.knee).y - p(s.hip).y) / shin;
+        // Heel rise: how much higher the heel is than the toe, ÷ foot length
+        let heelRise = null;
+        if (seen(s.heel, s.toe)) {
+          const footLen = dist(p(s.heel), p(s.toe));
+          if (footLen > 5) heelRise = smoothHeel((p(s.toe).y - p(s.heel).y) / footLen);
+        }
+
+        kneeEl.textContent = `Side · Knee ${knee.toFixed(0)}° · Lean ${lean.toFixed(0)}°`;
+        sideFrame({ knee, lean, hipGap, heelRise });
       }
-      lostFrames = 0;
-      if (cueEl.textContent.startsWith("Step back")) cueEl.textContent = "";
 
-      // Side-on check: angles are only trustworthy within a few degrees of side-on
-      const turned = degreesFromSideOn(p);
-      if (turned > SIDE_ON_LIMIT) {
-        kneeEl.textContent = "";
-        showCue("Turn sideways to the camera", "#ff4d4d");
-        if (!turnedWarned) { beep(lowBeep); say("Turn sideways"); turnedWarned = true; }
-        return;   // pause counting while you're facing the camera
+      if (mode === "front") {
+        if (!seen(23, 24, 25, 26, 27, 28)) { cantSeeYou("Step back — I can't see your legs"); return; }
+        lostFrames = 0;
+        if (warned.startsWith("Step back") || warned.startsWith("Turn")) clearWarning();
+
+        highlight([23, 25, 27], "#fff200");
+        highlight([24, 26, 28], "#fff200");
+
+        const midHipY = (p(23).y + p(24).y) / 2;
+        const midAnkleY = (p(27).y + p(28).y) / 2;
+        const height = smoothHeight(Math.max(midAnkleY - midHipY, 1));
+        // Knees caving in: compare the gap between your knees with the gap between your ankles
+        const hipWidth = Math.abs(p(23).x - p(24).x);
+        const ankleGap = Math.abs(p(27).x - p(28).x);
+        const kneeGap = Math.abs(p(25).x - p(26).x);
+        // If your feet are very close together, the comparison isn't meaningful, so skip it
+        const kneeRatio = ankleGap >= 0.5 * hipWidth ? smoothKneeRatio(kneeGap / ankleGap) : null;
+
+        const ratio = frontFrame({ height, kneeRatio });
+        kneeEl.textContent = kneeRatio === null
+          ? "Front · Feet a bit wider apart"
+          : `Front · Knees ${(kneeRatio * 100).toFixed(0)}% of ankle gap`;
+        void ratio;
       }
-      turnedWarned = false;
-      if (cueEl.textContent.startsWith("Turn sideways")) cueEl.textContent = "";
-
-      const kneeAngle = smooth(angle(p(hip), p(knee), p(ankle)));
-      // Hip gap: how far the hip is above the knee, divided by shin length.
-      // About 0 = hip level with knee; negative = hip below knee. (Logged for research.)
-      const shin = Math.max(Math.hypot(p(ankle).x - p(knee).x, p(ankle).y - p(knee).y), 1);
-      const hipGap = (p(knee).y - p(hip).y) / shin;
-
-      kneeEl.textContent = `Knee ${kneeAngle.toFixed(0)}°`;
-      updateReps(kneeAngle, hipGap);
     }
 
-    // ---------- Buttons ----------
+    // =====================================================================
+    // BUTTONS
+    // =====================================================================
     startBtn.addEventListener("click", () => {
-      // iPhone only allows sound that starts from a tap, so unlock it and say something real now
       unlockSound();
       say("Let's go");
       startCamera().catch((err) => { statusEl.textContent = "Camera error: " + err.message; });
@@ -516,19 +630,16 @@
       soundOn = !soundOn;
       soundBtn.textContent = `Sound: ${soundOn ? "on" : "off"}`;
       if (!soundOn && "speechSynthesis" in window) speechSynthesis.cancel();
-      if (soundOn) {
-        // Tapping "Sound: on" is also a sound test, and re-unlocks sound on iPhone
-        useLoudSpeaker();
-        beep(goodBeep);   // playing straight from a tap also unlocks it
-        say("Sound on");
-      }
+      if (soundOn) { useLoudSpeaker(); beep(goodBeep); say("Sound on"); }
     });
 
     // Save every rep as a spreadsheet file (CSV), for your accuracy testing
     saveBtn.addEventListener("click", () => {
       if (log.length === 0) { showCue("No reps yet", "#ffffff"); return; }
-      const header = "set,attempt,counted,lowest_knee_deg,lowest_hip_gap,cue,time";
-      const rows = log.map((r) => [r.set, r.attempt, r.counted, r.lowestKnee, r.lowestHipGap, r.cue, r.time].join(","));
+      const cols = ["set", "attempt", "view", "counted", "lowestKnee", "maxLean", "maxHeelLift",
+                    "minKneeRatio", "lowestHipGap", "cue", "time"];
+      const header = "set,attempt,view,counted,lowest_knee_deg,max_lean_deg,max_heel_lift,min_knee_ratio,lowest_hip_gap,cue,time";
+      const rows = log.map((r) => cols.map((c) => r[c]).join(","));
       const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
