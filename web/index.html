@@ -131,10 +131,11 @@
 
     // ---- SIDE VIEW: depth, chest and heels ----
     const DOWN = 120;             // knee angle below this = you're squatting
-    const UP = 155;               // knee angle above this = standing again (rep done)
+    const UP = 150;               // knee angle above this = standing again (rep done)
     const DEEP_ENOUGH = 80;       // lowest knee angle must get below this to count
     const LEAN_LIMIT = 60;        // torso leaning more than this (degrees from upright) = "Chest up"
-    const HEEL_LIFT_LIMIT = 0.12; // heel rising more than 8% of your shin length (~5 cm) = "Heels down"
+    const HEEL_LIFT_LIMIT = 0.25; // heel rising more than 25% of shin length = "Heels down".
+                                  // Your good reps measured 0.07-0.17 (camera noise), so only a big lift is caught.
     const HEEL_FRAMES = 5;        // ...and it has to stay up for ~1/3 s (ignores one-frame glitches)
     const FOOT_VIS = 0.7;         // only trust heel/toe points the AI is fairly sure about
 
@@ -201,7 +202,7 @@
       f.reset = () => { h = []; };
       return f;
     }
-    const smoothKnee = makeSmoother(5);
+    const smoothKnee = makeSmoother(3);   // short window so fast reps aren't smoothed away
     const smoothLean = makeSmoother(5);
     const smoothHeel = makeSmoother(5);
     const smoothHeight = makeSmoother(5);
@@ -530,7 +531,7 @@
     // =====================================================================
     // Runs ~15 times a second (plenty for squats) so the phone doesn't overheat or run out of memory.
     // Any error is shown on screen instead of silently freezing the app.
-    let FRAME_MS = 66;   // grows automatically if the phone is struggling
+    let FRAME_MS = 50;   // grows a little if the phone is struggling
     let lastVideoTime = -1, lastRun = 0, lastTimestamp = 0, errorCount = 0;
     function loop() {
       try {
@@ -548,7 +549,7 @@
           const result = landmarker.detectForVideo(video, ts);
           const took = performance.now() - t0;
           // If the AI is slow on this phone, give it more breathing room between frames
-          FRAME_MS = Math.min(200, Math.max(66, took * 2));
+          FRAME_MS = Math.min(100, Math.max(50, took * 1.3));   // never drop below ~10 checks a second
           draw(result);
           errorCount = 0;
         }
