@@ -203,9 +203,51 @@
 
     // Spoken cues, so you don't have to read the screen mid-rep
     let soundOn = true;
+
+    // Ask iPhone to play sound through the speaker even on silent mode / while the camera is on
+    // (works on newer iPhones; older ones just ignore it)
+    function useLoudSpeaker() {
+      try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+    }
+
+    // Beeps: a backup in case spoken feedback is blocked. Built in code, so no sound files needed.
+    function makeBeep(freq, ms) {
+      const rate = 22050, n = Math.floor(rate * ms / 1000);
+      const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+      const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+      w(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); w(8, "WAVE"); w(12, "fmt ");
+      v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true);
+      v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, n * 2, true);
+      for (let i = 0; i < n; i++) {
+        const fade = Math.min(1, i / 200, (n - i) / 200);   // avoid clicks
+        v.setInt16(44 + i * 2, Math.sin(2 * Math.PI * freq * i / rate) * 0.6 * fade * 32767, true);
+      }
+      return new Audio(URL.createObjectURL(new Blob([buf], { type: "audio/wav" })));
+    }
+    const goodBeep = makeBeep(880, 180);   // high beep = good rep
+    const lowBeep = makeBeep(330, 300);    // low beep = too shallow / warning
+
+    function beep(sound) {
+      if (!soundOn) return;
+      try { sound.currentTime = 0; sound.play().catch(() => {}); } catch (e) {}
+    }
+
+    // Must run inside a tap: iPhone only allows sound that starts from one
+    function unlockSound() {
+      useLoudSpeaker();
+      for (const s of [goodBeep, lowBeep]) {
+        s.muted = true;
+        s.play().then(() => { s.pause(); s.currentTime = 0; s.muted = false; })
+                .catch(() => { s.muted = false; });
+      }
+    }
+
     function speakNow(text) {
       const u = new SpeechSynthesisUtterance(text);
       u.lang = "en-US";
+      const voice = speechSynthesis.getVoices().find((vc) => vc.lang && vc.lang.startsWith("en"));
+      if (voice) u.voice = voice;
       u.rate = 1.05;
       u.volume = 1;
       speechSynthesis.speak(u);
@@ -236,10 +278,12 @@
           if (good) {
             reps += 1;
             showCue("Good rep!", "#00e676");
+            beep(goodBeep);
             say(String(reps));
           } else {
             shallow += 1;
             showCue("Too shallow – go lower", "#ffab00");
+            beep(lowBeep);
             say("Lower");
           }
           showReps();
@@ -430,7 +474,7 @@
       if (turned > SIDE_ON_LIMIT) {
         kneeEl.textContent = "";
         showCue("Turn sideways to the camera", "#ff4d4d");
-        if (!turnedWarned) { say("Turn sideways"); turnedWarned = true; }
+        if (!turnedWarned) { beep(lowBeep); say("Turn sideways"); turnedWarned = true; }
         return;   // pause counting while you're facing the camera
       }
       turnedWarned = false;
@@ -448,7 +492,8 @@
 
     // ---------- Buttons ----------
     startBtn.addEventListener("click", () => {
-      // iPhone only allows speech that starts from a tap, so say something real now
+      // iPhone only allows sound that starts from a tap, so unlock it and say something real now
+      unlockSound();
       say("Let's go");
       startCamera().catch((err) => { statusEl.textContent = "Camera error: " + err.message; });
     });
@@ -471,6 +516,12 @@
       soundOn = !soundOn;
       soundBtn.textContent = `Sound: ${soundOn ? "on" : "off"}`;
       if (!soundOn && "speechSynthesis" in window) speechSynthesis.cancel();
+      if (soundOn) {
+        // Tapping "Sound: on" is also a sound test, and re-unlocks sound on iPhone
+        useLoudSpeaker();
+        beep(goodBeep);   // playing straight from a tap also unlocks it
+        say("Sound on");
+      }
     });
 
     // Save every rep as a spreadsheet file (CSV), for your accuracy testing
