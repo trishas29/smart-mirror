@@ -146,7 +146,8 @@
     // ---- Which way you're facing ----
     // Side-on, your shoulders line up and look narrow; facing the camera, they look wide.
     const SIDE_ON_LIMIT = 20;          // under this many degrees from side-on = SIDE view (Dr. Bini: 10)
-    const FRONT_ON_MIN = 60;           // over this = FRONT view; in between = "turn fully"
+    const FRONT_VIEW_ON = false;       // knee-cave check from the front: switched off for this version
+    const FRONT_ON_MIN = 60;           // (only used if FRONT_VIEW_ON) over this = FRONT view
     const SHOULDER_RATIO_FRONT = 0.75; // shoulder width ÷ torso length when facing the camera (typical)
     const MODE_SWITCH_FRAMES = 10;     // must face a new way for ~2/3 s before switching
 
@@ -419,7 +420,7 @@
     // Switch view only after facing a new way for a moment, so it doesn't flicker
     function decideMode(turned) {
       // Hysteresis: once in a view, you must turn 10° further before it changes
-      let raw = turned < SIDE_ON_LIMIT ? "side" : turned > FRONT_ON_MIN ? "front" : "between";
+      let raw = turned < SIDE_ON_LIMIT ? "side" : (FRONT_VIEW_ON && turned > FRONT_ON_MIN) ? "front" : "between";
       if (mode === "side" && turned < SIDE_ON_LIMIT + 10) raw = "side";
       if (mode === "front" && turned > FRONT_ON_MIN - 10) raw = "front";
       if (mode === null) { mode = raw; onModeChange(); return; }
@@ -486,8 +487,9 @@
       stream = await navigator.mediaDevices.getUserMedia({
         video: {
           facingMode: { ideal: facing },
-          width: { ideal: portrait ? 720 : 1280 },
-          height: { ideal: portrait ? 1280 : 720 }
+          // Lower resolution = much less work for the phone. The AI shrinks every frame to 256 px anyway.
+          width: { ideal: portrait ? 480 : 640 },
+          height: { ideal: portrait ? 640 : 480 }
         },
         audio: false
       });
@@ -503,8 +505,8 @@
       startBtn.style.display = "none";
       toolbar.style.display = "flex";
       showReps();
-      statusEl.textContent = "Side-on: depth, chest, heels · Facing me: knees";
-      setTimeout(() => { if (statusEl.textContent.startsWith("Side-on")) statusEl.textContent = ""; }, 6000);
+      statusEl.textContent = "Stand side-on: depth, back, heels";
+      setTimeout(() => { if (statusEl.textContent.startsWith("Stand")) statusEl.textContent = ""; }, 6000);
       keepScreenOn();
       if (!looping) { looping = true; requestAnimationFrame(loop); }
     }
@@ -592,7 +594,7 @@
       decideMode(degreesFromSideOn(p));
 
       if (mode === "between") {
-        warn("Turn fully sideways – or face me", "Turn sideways");
+        warn(FRONT_VIEW_ON ? "Turn fully sideways – or face me" : "Turn sideways to the camera", "Turn sideways");
         return;   // angles aren't trustworthy at this angle, so pause
       }
 
