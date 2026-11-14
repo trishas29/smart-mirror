@@ -134,7 +134,9 @@
     const UP = 155;               // knee angle above this = standing again (rep done)
     const DEEP_ENOUGH = 80;       // lowest knee angle must get below this to count
     const LEAN_LIMIT = 50;        // torso leaning more than this (degrees from upright) = "Chest up"
-    const HEEL_LIFT_LIMIT = 0.15; // heel rising more than 15% of your foot length = "Heels down"
+    const HEEL_LIFT_LIMIT = 0.08; // heel rising more than 8% of your shin length (~3 cm) = "Heels down"
+    const HEEL_FRAMES = 5;        // ...and it has to stay up for ~1/3 s (ignores one-frame glitches)
+    const FOOT_VIS = 0.7;         // only trust heel/toe points the AI is fairly sure about
 
     // ---- FRONT VIEW: knees caving in ----
     const FRONT_DOWN = 0.85;      // hip height below 85% of your standing hip height = squatting
@@ -282,13 +284,15 @@
     let setNumber = 1;
     let rep = {};                 // the worst values seen during the current rep
     let heelBaseline = null;      // what "heels flat" looks like for you, learned while standing
+    let heelFrames = 0;           // how many frames in a row the heel has looked lifted
     let standingHeight = null;    // your standing hip height (front view)
     let cueUntil = 0;
     let warned = "";              // so a warning is spoken once, not every frame
     const log = [];
 
     function resetRep() {
-      rep = { lowestKnee: 180, maxLean: 0, maxHeel: 0, heelSeen: false, lowestHipGap: 99,
+      heelFrames = 0;
+      rep = { lowestKnee: 180, maxLean: 0, maxHeel: 0, heelSeen: false, heelUp: false, lowestHipGap: 99,
               minKneeRatio: 9, kneesSeen: false };
     }
     resetRep();
@@ -356,13 +360,16 @@
         rep.lowestHipGap = Math.min(rep.lowestHipGap, f.hipGap);
         if (f.heelRise !== null && heelBaseline !== null) {
           rep.heelSeen = true;
-          rep.maxHeel = Math.max(rep.maxHeel, f.heelRise - heelBaseline);
+          const lift = f.heelRise - heelBaseline;
+          rep.maxHeel = Math.max(rep.maxHeel, lift);
+          heelFrames = lift > HEEL_LIFT_LIMIT ? heelFrames + 1 : 0;
+          if (heelFrames >= HEEL_FRAMES) rep.heelUp = true;
         }
         if (f.knee > UP) {
           state = "up";
           const deep = rep.lowestKnee <= DEEP_ENOUGH;
           const leaning = rep.maxLean > LEAN_LIMIT;
-          const heelsUp = rep.heelSeen && rep.maxHeel > HEEL_LIFT_LIMIT;
+          const heelsUp = rep.heelUp;
           // One cue at a time, most important first
           if (!deep) finishRep("side", false, "Too shallow – go lower", "Lower");
           else if (leaning) finishRep("side", true, "Keep your chest up", `${reps + 1}. Chest up`);
@@ -606,11 +613,13 @@
         // Hip gap (logged for research): hip height above knee ÷ shin length
         const shin = Math.max(dist(p(s.ankle), p(s.knee)), 1);
         const hipGap = (p(s.knee).y - p(s.hip).y) / shin;
-        // Heel rise: how much higher the heel is than the toe, ÷ foot length
+        // Heel rise: how much higher the heel is than the toe, ÷ shin length.
+        // (The foot is only a few pixels long on screen, so dividing by it magnified tiny wobbles.)
         let heelRise = null;
-        if (seen(s.heel, s.toe)) {
-          const footLen = dist(p(s.heel), p(s.toe));
-          if (footLen > 5) heelRise = smoothHeel((p(s.toe).y - p(s.heel).y) / footLen);
+        if (lms[s.heel].visibility >= FOOT_VIS && lms[s.toe].visibility >= FOOT_VIS) {
+          heelRise = smoothHeel((p(s.toe).y - p(s.heel).y) / shin);
+        } else {
+          smoothHeel.reset();   // heel hidden (e.g. behind your calf at the bottom): don't guess
         }
 
         kneeEl.textContent = `Side · Knee ${knee.toFixed(0)}° · Lean ${lean.toFixed(0)}°`;
