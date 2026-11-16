@@ -160,6 +160,19 @@
       border-radius: 10px;
       text-align: center;
     }
+    /* Small speed readout, top left, for finding the lag */
+    #perf {
+      position: absolute;
+      left: 8px;
+      top: calc(env(safe-area-inset-top) + 8px);
+      font: 600 13px ui-monospace, Menlo, monospace;
+      color: #fff;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 4px 8px;
+      border-radius: 8px;
+      z-index: 20;
+    }
+    #perf:empty { display: none; }
     #startHint {
       position: absolute;
       top: calc(50% + 125px);
@@ -219,6 +232,7 @@
         <button id="setBtn">Set</button>
       </div>
     </div>
+    <div id="perf"></div>
     <div id="toolbar">
       <label class="weight-box">Weight
         <input id="weightInput" type="number" inputmode="decimal" min="0" step="2.5" value="0"> lb</label>
@@ -650,7 +664,7 @@
     // The AI runs on the graphics chip (GPU) by default: it's much faster, so the app stays smooth.
     // If the GPU fails or gets very slow, it switches to the main processor (CPU) by itself.
     // Force one with ?cpu=1, or use the bigger model with ?model=full
-    const APP_VERSION = "v8";
+    const APP_VERSION = "v9";
     let vision = null, usingGPU = false, switching = false, slowFrames = 0;
     const q = new URLSearchParams(location.search);
     const SIZE = q.get("model") === "full" ? "full" : "lite";
@@ -761,6 +775,8 @@
       return small;
     }
     let lastVideoTime = -1, lastRun = 0, lastTimestamp = 0, errorCount = 0;
+    const perfEl = document.getElementById("perf");
+    let perfAI = 0, perfChecks = 0, perfFrames = 0, perfSince = performance.now();
     function loop() {
       try {
         const now = performance.now();
@@ -783,6 +799,8 @@
             throw err;
           }
           const took = performance.now() - t0;
+          perfAI = perfAI * 0.9 + took * 0.1;
+          perfChecks += 1;
           if (usingGPU) {
             FRAME_MS = 50;   // ~20 checks a second on the GPU
             slowFrames = took > 300 ? slowFrames + 1 : 0;
@@ -795,6 +813,13 @@
           errorCount = 0;
         }
         if (cueEl.textContent && now > cueUntil) cueEl.textContent = "";
+        // Once a second: how long the AI takes per check, checks per second, screen frames per second
+        perfFrames += 1;
+        if (now - perfSince >= 1000) {
+          const secs = (now - perfSince) / 1000;
+          perfEl.textContent = `${APP_VERSION} · ${usingGPU ? "GPU" : "CPU"} · AI ${perfAI.toFixed(0)} ms · ${(perfChecks / secs).toFixed(0)} checks/s · screen ${(perfFrames / secs).toFixed(0)} fps`;
+          perfSince = now; perfChecks = 0; perfFrames = 0;
+        }
       } catch (err) {
         errorCount += 1;
         statusEl.textContent = "Error: " + (err && err.message ? err.message : err);
