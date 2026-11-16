@@ -209,7 +209,7 @@
 </head>
 <body>
   <div id="stage">
-    <video id="video" playsinline muted></video>
+    <video id="video" playsinline muted autoplay></video>
     <canvas id="canvas"></canvas>
     <div id="reps" class="big-text"></div>
     <div id="knee" class="big-text"></div>
@@ -341,7 +341,8 @@
     // =====================================================================
     let soundOn = true;
     function useLoudSpeaker() {
-      try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+      // Switched off: changing the iPhone's audio mode PAUSED THE CAMERA every time a sound played,
+      // which froze the picture. Sound now follows the phone's normal settings (silent switch off).
     }
     function makeBeep(freq, ms) {
       const rate = 22050, n = Math.floor(rate * ms / 1000);
@@ -664,7 +665,7 @@
     // The AI runs on the graphics chip (GPU) by default: it's much faster, so the app stays smooth.
     // If the GPU fails or gets very slow, it switches to the main processor (CPU) by itself.
     // Force one with ?cpu=1, or use the bigger model with ?model=full
-    const APP_VERSION = "v10";
+    const APP_VERSION = "v11";
     let vision = null, usingGPU = false, switching = false;
     const q = new URLSearchParams(location.search);
     const SIZE = q.get("model") === "full" ? "full" : "lite";
@@ -777,12 +778,15 @@
       smallCtx.drawImage(video, 0, 0, w, h);
       return small;
     }
-    let lastVideoTime = -1, lastRun = 0, lastTimestamp = 0, errorCount = 0;
+    let lastVideoTime = -1, lastRun = 0, lastTimestamp = 0, errorCount = 0, lastResume = 0;
+    // If the iPhone pauses the camera (e.g. when a sound plays), start it again straight away
+    video.addEventListener("pause", () => { if (stream) video.play().catch(() => {}); });
     const perfEl = document.getElementById("perf");
     let perfAI = 0, perfChecks = 0, perfFrames = 0, perfSince = performance.now(), gpuErrors = 0;
     function loop() {
       try {
         const now = performance.now();
+        if (stream && video.paused && now - lastResume > 500) { lastResume = now; video.play().catch(() => {}); }
         if (video.readyState >= 2 && video.currentTime !== lastVideoTime && now - lastRun >= FRAME_MS) {
           lastRun = now;
           lastVideoTime = video.currentTime;
