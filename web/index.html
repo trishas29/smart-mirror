@@ -728,7 +728,20 @@
     // =====================================================================
     // Runs ~15 times a second (plenty for squats) so the phone doesn't overheat or run out of memory.
     // Any error is shown on screen instead of silently freezing the app.
-    let FRAME_MS = 50;   // grows a little if the phone is struggling
+    let FRAME_MS = 80;   // ~12 checks a second; grows a little if the phone is struggling
+    // The AI only needs a small picture (it shrinks every frame to 256 px anyway).
+    // Copying a small picture instead of the full camera frame takes far less work,
+    // which keeps the screen and buttons responsive.
+    const small = document.createElement("canvas");
+    const smallCtx = small.getContext("2d", { willReadFrequently: true });
+    function smallFrame() {
+      const vw = video.videoWidth, vh = video.videoHeight;
+      const k = 256 / Math.max(vw, vh);
+      const w = Math.round(vw * k), h = Math.round(vh * k);
+      if (small.width !== w || small.height !== h) { small.width = w; small.height = h; }
+      smallCtx.drawImage(video, 0, 0, w, h);
+      return small;
+    }
     let lastVideoTime = -1, lastRun = 0, lastTimestamp = 0, errorCount = 0;
     function loop() {
       try {
@@ -743,10 +756,11 @@
           const ts = Math.max(Math.round(now), lastTimestamp + 1);   // timestamps must always increase
           lastTimestamp = ts;
           const t0 = performance.now();
-          const result = landmarker.detectForVideo(video, ts);
+          const result = landmarker.detectForVideo(smallFrame(), ts);
           const took = performance.now() - t0;
           // If the AI is slow on this phone, give it more breathing room between frames
-          FRAME_MS = Math.min(100, Math.max(50, took * 1.3));   // never drop below ~10 checks a second
+          // Leave the phone at least as much free time as the AI used, so taps and the screen stay smooth
+          FRAME_MS = Math.min(125, Math.max(80, took * 2));   // never drop below ~8 checks a second
           draw(result);
           errorCount = 0;
         }
