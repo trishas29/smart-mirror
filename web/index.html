@@ -110,6 +110,56 @@
       font-size: 20px;
       white-space: nowrap;
     }
+    /* Weight advice panel: stays on screen until you tap a button */
+    #advice {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      width: min(88vw, 520px);
+      box-sizing: border-box;
+      padding: 22px 20px;
+      border-radius: 20px;
+      background: rgba(0, 0, 0, 0.88);
+      border: 3px solid #40c4ff;
+      text-align: center;
+      display: none;
+      z-index: 10;
+    }
+    #adviceText {
+      font-size: clamp(24px, 7vw, 40px);
+      font-weight: 800;
+      line-height: 1.2;
+      color: #40c4ff;
+      margin-bottom: 18px;
+    }
+    #adviceButtons, #customRow {
+      display: flex;
+      gap: 10px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    #advice button {
+      font-size: clamp(18px, 5vw, 24px);
+      font-weight: 700;
+      padding: 14px 18px;
+      border: none;
+      border-radius: 14px;
+      background: #2962ff;
+      color: #fff;
+    }
+    #advice #okBtn { background: #00c853; }
+    #advice #customBtn { background: #555; }
+    #customRow { display: none; margin-top: 14px; align-items: center; color: #fff; font-size: 20px; }
+    #customInput {
+      width: 90px;
+      font-size: 22px;
+      font-weight: 700;
+      padding: 8px;
+      border: none;
+      border-radius: 10px;
+      text-align: center;
+    }
     #startHint {
       position: absolute;
       top: calc(50% + 125px);
@@ -156,6 +206,19 @@
     <label id="startWeight" class="weight-box">Extra weight
       <input id="startWeightInput" type="number" inputmode="decimal" min="0" step="2.5" value="0"> lb</label>
     <div id="startHint">0 = bodyweight squats. Change it any time.</div>
+    <div id="advice">
+      <div id="adviceText"></div>
+      <div id="adviceButtons">
+        <button id="plusBtn">+2.5 lb</button>
+        <button id="minusBtn">&minus;2.5 lb</button>
+        <button id="customBtn">Custom</button>
+        <button id="okBtn">OK</button>
+      </div>
+      <div id="customRow">
+        <input id="customInput" type="number" inputmode="decimal" min="0" step="2.5"> lb
+        <button id="setBtn">Set</button>
+      </div>
+    </div>
     <div id="toolbar">
       <label class="weight-box">Weight
         <input id="weightInput" type="number" inputmode="decimal" min="0" step="2.5" value="0"> lb</label>
@@ -205,7 +268,7 @@
 
     const VIS_OK = 0.5;           // a body point counts as visible above this score
     const LOST_FRAMES = 15;       // ~half a second of not seeing you before warning
-    const CUE_SECONDS = 2;        // how long a cue stays on screen
+    const CUE_SECONDS = 4;        // how long a cue stays on screen
 
     // =====================================================================
 
@@ -367,21 +430,73 @@
       return Number.isFinite(w) && w > 0 ? w : 0;     // empty or 0 = bodyweight
     }
     startWeightInput.addEventListener("input", () => { weightInput.value = startWeightInput.value; });
+
+    // ---- Advice panel: stays up until you tap OK or change the weight ----
+    const adviceEl = document.getElementById("advice");
+    const adviceTextEl = document.getElementById("adviceText");
+    const plusBtn = document.getElementById("plusBtn");
+    const minusBtn = document.getElementById("minusBtn");
+    const customBtn = document.getElementById("customBtn");
+    const okBtn = document.getElementById("okBtn");
+    const customRow = document.getElementById("customRow");
+    const customInput = document.getElementById("customInput");
+    const setBtn = document.getElementById("setBtn");
+
+    // kind: "up" = suggest heavier, "down" = suggest lighter, "form" = bodyweight, just OK
+    function showAdvice(text, kind) {
+      adviceTextEl.textContent = text;
+      plusBtn.style.display = kind === "up" ? "" : "none";
+      minusBtn.style.display = kind === "down" ? "" : "none";
+      customBtn.style.display = kind === "form" ? "none" : "";
+      customRow.style.display = "none";
+      adviceEl.style.display = "block";
+    }
+    function closeAdvice() { adviceEl.style.display = "none"; }
+    function setWeight(w) {
+      w = Math.max(0, Math.round(w * 10) / 10);
+      weightInput.value = String(w);
+      startWeightInput.value = String(w);
+      cleanInARow = 0;
+      shallowInARow = 0;
+      closeAdvice();
+      const label = w === 0 ? "Bodyweight" : `Weight: ${w} lb`;
+      showCue(label, "#40c4ff");
+      say(w === 0 ? "Bodyweight" : `${w} pounds`);
+    }
+    plusBtn.addEventListener("click", () => setWeight(extraWeight() + 2.5));
+    minusBtn.addEventListener("click", () => setWeight(extraWeight() - 2.5));
+    okBtn.addEventListener("click", closeAdvice);
+    customBtn.addEventListener("click", () => {
+      customInput.value = String(extraWeight());
+      customRow.style.display = "flex";
+      customInput.focus();
+    });
+    setBtn.addEventListener("click", () => {
+      const w = parseFloat(customInput.value);
+      if (Number.isFinite(w)) setWeight(w);
+    });
+    weightInput.addEventListener("change", () => { cleanInARow = 0; shallowInARow = 0; });
+
     // After each rep: check for a streak and give advice once per streak
     function weightAdvice(counted) {
       if (counted) { cleanInARow += 1; shallowInARow = 0; } else { shallowInARow += 1; cleanInARow = 0; }
       const bodyweight = extraWeight() === 0;
-      let advice = "";
+      let advice = "", kind = "";
       if (cleanInARow === CLEAN_STREAK) {
+        kind = "up";
         advice = bodyweight ? "10 clean reps! You may want to start adding weight"
                             : "10 clean reps! You may want to increase your weight lifted";
         cleanInARow = 0;
       } else if (shallowInARow === SHALLOW_STREAK) {
+        kind = bodyweight ? "form" : "down";
         advice = bodyweight ? "Focus on your form and the depth of your squat"
                             : "You may want to decrease your weight lifted";
         shallowInARow = 0;
       }
-      if (advice) { showCue(advice, "#40c4ff", 5); say(advice); }
+      if (advice) {
+        showAdvice(advice, kind);
+        say(advice);
+      }
       return advice;
     }
     function warn(text, speech) {
