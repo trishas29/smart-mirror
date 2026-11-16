@@ -664,8 +664,8 @@
     // The AI runs on the graphics chip (GPU) by default: it's much faster, so the app stays smooth.
     // If the GPU fails or gets very slow, it switches to the main processor (CPU) by itself.
     // Force one with ?cpu=1, or use the bigger model with ?model=full
-    const APP_VERSION = "v9";
-    let vision = null, usingGPU = false, switching = false, slowFrames = 0;
+    const APP_VERSION = "v10";
+    let vision = null, usingGPU = false, switching = false;
     const q = new URLSearchParams(location.search);
     const SIZE = q.get("model") === "full" ? "full" : "lite";
     const MODEL = (size) =>
@@ -697,13 +697,16 @@
       if (switching || !usingGPU) return;
       switching = true;
       console.warn("Switching to CPU:", reason);
+      const giveUp = setTimeout(() => { switching = false; }, 8000);   // never stay stuck
       try {
+        const cpu = await PoseLandmarker.createFromOptions(vision, options("lite", "CPU"));
         const old = landmarker;
-        landmarker = await PoseLandmarker.createFromOptions(vision, options("lite", "CPU"));
+        landmarker = cpu;
         usingGPU = false;
         modelInfo = "lite, CPU";
         try { old.close(); } catch (e) {}
       } catch (e) { console.error(e); }
+      clearTimeout(giveUp);
       switching = false;
     }
 
@@ -776,11 +779,11 @@
     }
     let lastVideoTime = -1, lastRun = 0, lastTimestamp = 0, errorCount = 0;
     const perfEl = document.getElementById("perf");
-    let perfAI = 0, perfChecks = 0, perfFrames = 0, perfSince = performance.now();
+    let perfAI = 0, perfChecks = 0, perfFrames = 0, perfSince = performance.now(), gpuErrors = 0;
     function loop() {
       try {
         const now = performance.now();
-        if (!switching && video.readyState >= 2 && video.currentTime !== lastVideoTime && now - lastRun >= FRAME_MS) {
+        if (video.readyState >= 2 && video.currentTime !== lastVideoTime && now - lastRun >= FRAME_MS) {
           lastRun = now;
           lastVideoTime = video.currentTime;
           if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
@@ -795,16 +798,21 @@
             // GPU: hand it the camera frame directly. CPU: hand it a small copy (far less work).
             result = landmarker.detectForVideo(usingGPU ? video : smallFrame(), ts);
           } catch (err) {
-            if (usingGPU) { switchToCPU(err); requestAnimationFrame(loop); return; }
+            gpuErrors += 1;
+            // Only give up on the GPU after repeated real errors, not one hiccup
+            if (usingGPU && gpuErrors >= 5) switchToCPU(err);
+            requestAnimationFrame(loop);
+            return;
             throw err;
           }
           const took = performance.now() - t0;
           perfAI = perfAI * 0.9 + took * 0.1;
           perfChecks += 1;
+          gpuErrors = 0;
           if (usingGPU) {
+            // The GPU is slow for its first few checks while it warms up. That's normal,
+            // so it's no longer treated as a reason to switch (that was the v8/v9 bug).
             FRAME_MS = 50;   // ~20 checks a second on the GPU
-            slowFrames = took > 300 ? slowFrames + 1 : 0;
-            if (slowFrames >= 3) switchToCPU("GPU too slow");
           } else {
             // Leave the phone at least as much free time as the AI used, so taps stay smooth
             FRAME_MS = Math.min(125, Math.max(80, took * 2));
@@ -817,7 +825,8 @@
         perfFrames += 1;
         if (now - perfSince >= 1000) {
           const secs = (now - perfSince) / 1000;
-          perfEl.textContent = `${APP_VERSION} · ${usingGPU ? "GPU" : "CPU"} · AI ${perfAI.toFixed(0)} ms · ${(perfChecks / secs).toFixed(0)} checks/s · screen ${(perfFrames / secs).toFixed(0)} fps`;
+          const why = perfChecks > 0 ? "" : video.readyState < 2 ? " · waiting for camera" : video.paused ? " · camera paused" : switching ? " · switching" : "";
+          perfEl.textContent = `${APP_VERSION} · ${usingGPU ? "GPU" : "CPU"} · AI ${perfAI.toFixed(0)} ms · ${(perfChecks / secs).toFixed(0)} checks/s · screen ${(perfFrames / secs).toFixed(0)} fps${why}`;
           perfSince = now; perfChecks = 0; perfFrames = 0;
         }
       } catch (err) {
