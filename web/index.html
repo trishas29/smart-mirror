@@ -81,6 +81,46 @@
     }
     #startBtn:disabled { background: #555; }
 
+    /* "Extra weight" box: on the start screen and in the toolbar */
+    .weight-box {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 16px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.25);
+      color: #fff;
+    }
+    .weight-box input {
+      width: 64px;
+      font-size: 18px;
+      font-weight: 700;
+      padding: 4px 6px;
+      border: none;
+      border-radius: 8px;
+      text-align: center;
+    }
+    #startWeight {
+      position: absolute;
+      top: calc(50% + 70px);
+      left: 50%;
+      transform: translateX(-50%);
+      font-size: 20px;
+      white-space: nowrap;
+    }
+    #startHint {
+      position: absolute;
+      top: calc(50% + 125px);
+      left: 50%;
+      transform: translateX(-50%);
+      width: 90vw;
+      text-align: center;
+      font-size: 15px;
+      color: #ddd;
+    }
+
     /* Small buttons along the bottom */
     #toolbar {
       position: absolute;
@@ -113,7 +153,12 @@
     <div id="cue" class="big-text"></div>
     <div id="status" class="big-text">Loading the AI model...</div>
     <button id="startBtn" disabled>Start camera</button>
+    <label id="startWeight" class="weight-box">Extra weight
+      <input id="startWeightInput" type="number" inputmode="decimal" min="0" step="2.5" value="0"> lb</label>
+    <div id="startHint">0 = bodyweight squats. Change it any time.</div>
     <div id="toolbar">
+      <label class="weight-box">Weight
+        <input id="weightInput" type="number" inputmode="decimal" min="0" step="2.5" value="0"> lb</label>
       <button id="newSetBtn">New set</button>
       <button id="soundBtn">Sound: on</button>
       <button id="saveBtn">Save log</button>
@@ -133,6 +178,7 @@
     const DOWN = 120;             // knee angle below this = you're squatting
     const UP = 150;               // knee angle above this = standing again (rep done)
     const DEEP_ENOUGH = 80;       // lowest knee angle must get below this to count
+    const LEAN_CHECK_ON = false;  // back-lean cue switched off: this version only judges the knee angle
     const LEAN_LIMIT = 60;        // torso leaning more than this (degrees from upright) = "Chest up"
     const HEEL_LIFT_LIMIT = 0.25; // heel rising more than 25% of shin length = "Heels down".
                                   // Your good reps measured 0.07-0.17 (camera noise), so only a big lift is caught.
@@ -153,6 +199,10 @@
     const MODE_SWITCH_FRAMES = 10;     // must face a new way for ~2/3 s before switching
 
     // ---- General ----
+    // ---- Weight advice ----
+    const CLEAN_STREAK = 10;      // this many good reps in a row = suggest going heavier
+    const SHALLOW_STREAK = 3;     // this many shallow reps in a row = suggest going lighter (or form, if bodyweight)
+
     const VIS_OK = 0.5;           // a body point counts as visible above this score
     const LOST_FRAMES = 15;       // ~half a second of not seeing you before warning
     const CUE_SECONDS = 2;        // how long a cue stays on screen
@@ -302,10 +352,37 @@
     function showReps() {
       repsEl.textContent = shallow > 0 ? `Reps ${reps} · ${shallow} shallow` : `Reps ${reps}`;
     }
-    function showCue(text, color) {
+    function showCue(text, color, seconds = CUE_SECONDS) {
       cueEl.textContent = text;
       cueEl.style.color = color;
-      cueUntil = performance.now() + CUE_SECONDS * 1000;
+      cueUntil = performance.now() + seconds * 1000;
+    }
+
+    // ---- Weight advice ----
+    let cleanInARow = 0, shallowInARow = 0;
+    const weightInput = document.getElementById("weightInput");
+    const startWeightInput = document.getElementById("startWeightInput");
+    function extraWeight() {
+      const w = parseFloat(weightInput.value);
+      return Number.isFinite(w) && w > 0 ? w : 0;     // empty or 0 = bodyweight
+    }
+    startWeightInput.addEventListener("input", () => { weightInput.value = startWeightInput.value; });
+    // After each rep: check for a streak and give advice once per streak
+    function weightAdvice(counted) {
+      if (counted) { cleanInARow += 1; shallowInARow = 0; } else { shallowInARow += 1; cleanInARow = 0; }
+      const bodyweight = extraWeight() === 0;
+      let advice = "";
+      if (cleanInARow === CLEAN_STREAK) {
+        advice = bodyweight ? "10 clean reps! You may want to start adding weight"
+                            : "10 clean reps! You may want to increase your weight lifted";
+        cleanInARow = 0;
+      } else if (shallowInARow === SHALLOW_STREAK) {
+        advice = bodyweight ? "Focus on your form and the depth of your squat"
+                            : "You may want to decrease your weight lifted";
+        shallowInARow = 0;
+      }
+      if (advice) { showCue(advice, "#40c4ff", 5); say(advice); }
+      return advice;
     }
     function warn(text, speech) {
       kneeEl.textContent = "";
@@ -328,9 +405,12 @@
         beep(goodBeep);
       }
       say(speech);
+      const advice = weightAdvice(counted);
       const entry = {
         set: setNumber,
         attempt: reps + shallow,
+        weight: extraWeight(),
+        advice,
         view,
         counted: counted ? "yes" : "no",
         lowestKnee: view === "side" ? Math.round(rep.lowestKnee) : "",
@@ -370,7 +450,7 @@
         if (f.knee > UP) {
           state = "up";
           const deep = rep.lowestKnee <= DEEP_ENOUGH;
-          const leaning = rep.maxLean > LEAN_LIMIT;
+          const leaning = LEAN_CHECK_ON && rep.maxLean > LEAN_LIMIT;
           const heelsUp = false;   // heel check removed: too unreliable with one phone camera
           // One cue at a time, most important first
           if (!deep) finishRep("side", false, "Too shallow – go lower", "Lower");
@@ -441,7 +521,7 @@
       // Only announce the view if it hasn't been announced in the last few seconds
       const now = performance.now();
       const announce = now - lastAnnounce > 4000;
-      if (mode === "side") { showCue("Side view: depth and back", "#ffffff"); if (announce) say("Side view"); }
+      if (mode === "side") { showCue("Side view: checking depth", "#ffffff"); if (announce) say("Side view"); }
       if (mode === "front") { showCue("Front view: knees", "#ffffff"); if (announce) say("Front view"); }
       if (announce && mode !== "between") lastAnnounce = now;
     }
@@ -511,9 +591,11 @@
       canvas.height = video.videoHeight;
       mode = null;
       startBtn.style.display = "none";
+      document.getElementById("startWeight").style.display = "none";
+      document.getElementById("startHint").style.display = "none";
       toolbar.style.display = "flex";
       showReps();
-      statusEl.textContent = "Stand side-on: depth and back";
+      statusEl.textContent = "Stand side-on, 2-3 metres away";
       setTimeout(() => { if (statusEl.textContent.startsWith("Stand")) statusEl.textContent = ""; }, 6000);
       keepScreenOn();
       if (!looping) { looping = true; requestAnimationFrame(loop); }
@@ -637,7 +719,7 @@
           smoothHeel.reset();   // heel hidden (e.g. behind your calf at the bottom): don't guess
         }
 
-        kneeEl.textContent = `Side · Knee ${knee.toFixed(0)}° · Lean ${lean.toFixed(0)}°`;
+        kneeEl.textContent = `Knee ${knee.toFixed(0)}°`;
         sideFrame({ knee, lean, hipGap, heelRise });
       }
 
@@ -685,6 +767,8 @@
       if (reps + shallow > 0) setNumber += 1;
       reps = 0;
       shallow = 0;
+      cleanInARow = 0;
+      shallowInARow = 0;
       state = "up";
       showReps();
       showCue(`Set ${setNumber}`, "#ffffff");
@@ -700,9 +784,8 @@
     // Save every rep as a spreadsheet file (CSV), for your accuracy testing
     saveBtn.addEventListener("click", () => {
       if (log.length === 0) { showCue("No reps yet", "#ffffff"); return; }
-      const cols = ["set", "attempt", "view", "counted", "lowestKnee", "maxLean", "maxHeelLift",
-                    "minKneeRatio", "lowestHipGap", "cue", "time"];
-      const header = "set,attempt,view,counted,lowest_knee_deg,max_lean_deg,max_heel_lift,min_knee_ratio,lowest_hip_gap,cue,time";
+      const cols = ["set", "attempt", "weight", "counted", "lowestKnee", "lowestHipGap", "cue", "advice", "time"];
+      const header = "set,attempt,extra_weight_lb,counted,lowest_knee_deg,lowest_hip_gap,cue,advice,time";
       const rows = log.map((r) => cols.map((c) => r[c]).join(","));
       const blob = new Blob([[header, ...rows].join("\n")], { type: "text/csv" });
       const a = document.createElement("a");
