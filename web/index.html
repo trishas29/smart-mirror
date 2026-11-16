@@ -647,33 +647,50 @@
     // =====================================================================
     let landmarker;
     let modelInfo = "";
+    // The AI runs on the graphics chip (GPU) by default: it's much faster, so the app stays smooth.
+    // If the GPU fails or gets very slow, it switches to the main processor (CPU) by itself.
+    // Force one with ?cpu=1, or use the bigger model with ?model=full
+    const APP_VERSION = "v8";
+    let vision = null, usingGPU = false, switching = false, slowFrames = 0;
+    const q = new URLSearchParams(location.search);
+    const SIZE = q.get("model") === "full" ? "full" : "lite";
+    const MODEL = (size) =>
+      `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${size}/float16/latest/pose_landmarker_${size}.task`;
+    const options = (size, delegate) => ({
+      baseOptions: { modelAssetPath: MODEL(size), delegate },
+      runningMode: "VIDEO",
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.4,
+      minPosePresenceConfidence: 0.4,
+      minTrackingConfidence: 0.4
+    });
     async function loadModel() {
-      const vision = await FilesetResolver.forVisionTasks(
+      vision = await FilesetResolver.forVisionTasks(
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
       );
-      const MODEL = (size) =>
-        `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${size}/float16/latest/pose_landmarker_${size}.task`;
-      const options = (size, delegate) => ({
-        baseOptions: { modelAssetPath: MODEL(size), delegate },
-        runningMode: "VIDEO",
-        numPoses: 1,
-        minPoseDetectionConfidence: 0.4,
-        minPosePresenceConfidence: 0.4,
-        minTrackingConfidence: 0.4
-      });
-      try {
-        // iPhone Safari can lock up when the AI runs on the graphics chip (GPU), so by default
-        // run the small model on the normal processor (CPU). Try others with ?model=full or ?gpu=1
-        const q = new URLSearchParams(location.search);
-        modelInfo = `${q.get("model") === "full" ? "full" : "lite"}, ${q.get("gpu") === "1" ? "GPU" : "CPU"}`;
-        landmarker = await PoseLandmarker.createFromOptions(vision,
-          options(q.get("model") === "full" ? "full" : "lite", q.get("gpu") === "1" ? "GPU" : "CPU"));
-      } catch (e) {
-        modelInfo = "lite, CPU";
-        landmarker = await PoseLandmarker.createFromOptions(vision, options("lite", "CPU"));
+      if (q.get("cpu") !== "1") {
+        try {
+          landmarker = await PoseLandmarker.createFromOptions(vision, options(SIZE, "GPU"));
+          usingGPU = true;
+        } catch (e) { usingGPU = false; }
       }
-      statusEl.textContent = `Ready (${modelInfo})`;
+      if (!usingGPU) landmarker = await PoseLandmarker.createFromOptions(vision, options("lite", "CPU"));
+      modelInfo = `${usingGPU ? SIZE : "lite"}, ${usingGPU ? "GPU" : "CPU"}`;
+      statusEl.textContent = `Ready (${modelInfo}, ${APP_VERSION})`;
       startBtn.disabled = false;
+    }
+    async function switchToCPU(reason) {
+      if (switching || !usingGPU) return;
+      switching = true;
+      console.warn("Switching to CPU:", reason);
+      try {
+        const old = landmarker;
+        landmarker = await PoseLandmarker.createFromOptions(vision, options("lite", "CPU"));
+        usingGPU = false;
+        modelInfo = "lite, CPU";
+        try { old.close(); } catch (e) {}
+      } catch (e) { console.error(e); }
+      switching = false;
     }
 
     // =====================================================================
@@ -733,11 +750,12 @@
     // Copying a small picture instead of the full camera frame takes far less work,
     // which keeps the screen and buttons responsive.
     const small = document.createElement("canvas");
-    const smallCtx = small.getContext("2d", { willReadFrequently: true });
+    let smallCtx = null;   // made on first use (only the CPU path needs it)
     function smallFrame() {
       const vw = video.videoWidth, vh = video.videoHeight;
       const k = 256 / Math.max(vw, vh);
       const w = Math.round(vw * k), h = Math.round(vh * k);
+      if (!smallCtx) smallCtx = small.getContext("2d", { willReadFrequently: true });
       if (small.width !== w || small.height !== h) { small.width = w; small.height = h; }
       smallCtx.drawImage(video, 0, 0, w, h);
       return small;
@@ -746,7 +764,7 @@
     function loop() {
       try {
         const now = performance.now();
-        if (video.readyState >= 2 && video.currentTime !== lastVideoTime && now - lastRun >= FRAME_MS) {
+        if (!switching && video.readyState >= 2 && video.currentTime !== lastVideoTime && now - lastRun >= FRAME_MS) {
           lastRun = now;
           lastVideoTime = video.currentTime;
           if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
@@ -756,11 +774,23 @@
           const ts = Math.max(Math.round(now), lastTimestamp + 1);   // timestamps must always increase
           lastTimestamp = ts;
           const t0 = performance.now();
-          const result = landmarker.detectForVideo(smallFrame(), ts);
+          let result;
+          try {
+            // GPU: hand it the camera frame directly. CPU: hand it a small copy (far less work).
+            result = landmarker.detectForVideo(usingGPU ? video : smallFrame(), ts);
+          } catch (err) {
+            if (usingGPU) { switchToCPU(err); requestAnimationFrame(loop); return; }
+            throw err;
+          }
           const took = performance.now() - t0;
-          // If the AI is slow on this phone, give it more breathing room between frames
-          // Leave the phone at least as much free time as the AI used, so taps and the screen stay smooth
-          FRAME_MS = Math.min(125, Math.max(80, took * 2));   // never drop below ~8 checks a second
+          if (usingGPU) {
+            FRAME_MS = 50;   // ~20 checks a second on the GPU
+            slowFrames = took > 300 ? slowFrames + 1 : 0;
+            if (slowFrames >= 3) switchToCPU("GPU too slow");
+          } else {
+            // Leave the phone at least as much free time as the AI used, so taps stay smooth
+            FRAME_MS = Math.min(125, Math.max(80, took * 2));
+          }
           draw(result);
           errorCount = 0;
         }
@@ -848,7 +878,8 @@
           smoothHeel.reset();   // heel hidden (e.g. behind your calf at the bottom): don't guess
         }
 
-        kneeEl.textContent = `Knee ${knee.toFixed(0)}°`;
+        const kneeText = `Knee ${knee.toFixed(0)}°`;
+        if (kneeEl.textContent !== kneeText) kneeEl.textContent = kneeText;   // only redraw text when it changes
         sideFrame({ knee, lean, hipGap, heelRise });
       }
 
